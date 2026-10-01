@@ -20,17 +20,27 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import android.nfc.NfcAdapter
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -38,6 +48,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
@@ -45,6 +56,8 @@ import androidx.core.content.ContextCompat
 import com.example.smartkeyaccess.ui.theme.SmartKeyAccessTheme
 import java.util.Locale
 import java.util.UUID
+import javax.crypto.Mac
+import javax.crypto.spec.SecretKeySpec
 
 /**
  * High-level lifecycle states of the BLE Central subsystem for Milestone M1.
@@ -83,6 +96,12 @@ class MainActivity : ComponentActivity() {
     private var scanning by mutableStateOf(false)
     private var status by mutableStateOf("Ready to find ESP32")
     private var rttTelemetryMs by mutableStateOf<Double?>(null)
+
+    // NFC Master Card Provisioning state (diagram_do_an-Trang-2.drawio.png)
+    private var nfcStatus by mutableStateOf("Chưa nạp Master Card")
+    private var vehicleId by mutableStateOf<ByteArray?>(null)
+    private var masterSecretKey by mutableStateOf<ByteArray?>(null)
+    private var hmacResultHex by mutableStateOf<String?>(null)
 
     private val handler = Handler(Looper.getMainLooper())
     private var scanner: BluetoothLeScanner? = null
@@ -166,19 +185,83 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun formatHex(bytes: ByteArray): String =
+        bytes.joinToString("") { String.format("%02X", it) }
+
+    private fun simulateMasterCardRead() {
+        val simulatedVid = "VID_0001".toByteArray(Charsets.UTF_8) // 8 bytes Vehicle ID
+        val simulatedMsk = byteArrayOf(
+            0x10.toByte(), 0x11.toByte(), 0x12.toByte(), 0x13.toByte(),
+            0x14.toByte(), 0x15.toByte(), 0x16.toByte(), 0x17.toByte(),
+            0x18.toByte(), 0x19.toByte(), 0x1A.toByte(), 0x1B.toByte(),
+            0x1C.toByte(), 0x1D.toByte(), 0x1E.toByte(), 0x1F.toByte()
+        ) // 16 bytes Master Secret Key
+        vehicleId = simulatedVid
+        masterSecretKey = simulatedMsk
+        nfcStatus = "Đã nạp Master Card!\nVID: ${formatHex(simulatedVid)} (8B)\nMSK: ${formatHex(simulatedMsk)} (16B)"
+        hmacResultHex = null
+    }
+
+    private fun startNfcReader() {
+        val adapter = NfcAdapter.getDefaultAdapter(this)
+        if (adapter == null) {
+            nfcStatus = "Thiết bị không có chip NFC phần cứng.\nVui lòng bấm 'Giả lập Master Card'."
+            return
+        }
+        if (!adapter.isEnabled) {
+            nfcStatus = "NFC đang tắt. Hãy bật NFC trong Cài đặt hệ thống."
+            return
+        }
+        nfcStatus = "NFC đang bật. Hãy áp thẻ Master Card vào lưng điện thoại..."
+    }
+
+    private fun computeHmacSha256(key: ByteArray, data: ByteArray): ByteArray {
+        val mac = Mac.getInstance("HmacSHA256")
+        val keySpec = SecretKeySpec(key, "HmacSHA256")
+        mac.init(keySpec)
+        return mac.doFinal(data)
+    }
+
+    private fun testHmacVerification() {
+        val msk = masterSecretKey
+        val vid = vehicleId
+        if (msk == null || vid == null) {
+            nfcStatus = "Lỗi: Cần nạp Master Card (VID + MSK) trước khi băm HMAC!"
+            return
+        }
+        // Giả lập nhận từ ESP32: vid (8 bytes) + nonce (16 bytes)
+        val simulatedNonce = byteArrayOf(
+            0xA0.toByte(), 0xA1.toByte(), 0xA2.toByte(), 0xA3.toByte(),
+            0xA4.toByte(), 0xA5.toByte(), 0xA6.toByte(), 0xA7.toByte(),
+            0xA8.toByte(), 0xA9.toByte(), 0xAA.toByte(), 0xAB.toByte(),
+            0xAC.toByte(), 0xAD.toByte(), 0xAE.toByte(), 0xAF.toByte()
+        )
+        val payload = vid + simulatedNonce
+        val hmac = computeHmacSha256(msk, payload)
+        hmacResultHex = formatHex(hmac)
+        nfcStatus = "Tính HMAC-SHA256 thành công (32 bytes)!\nInput: VID (${vid.size}B) + Nonce (${simulatedNonce.size}B)\nKey: MSK (${msk.size}B)"
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         setContent {
             SmartKeyAccessTheme {
                 Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
-                    ScanScreen(
+                    SmartKeyMainScreen(
                         bleState = bleState,
-                        status = status,
+                        bleStatus = status,
                         rttMs = rttTelemetryMs,
-                        isBusy = scanning || bleState == BleState.CONNECTING || bleState == BleState.DISCOVERING || bleState == BleState.MTU_NEGOTIATING || bleState == BleState.SUBSCRIBING,
-                        onFindClick = ::startFindingEsp32,
-                        onResetClick = ::resetConnection,
+                        isBleBusy = scanning || bleState == BleState.CONNECTING || bleState == BleState.DISCOVERING || bleState == BleState.MTU_NEGOTIATING || bleState == BleState.SUBSCRIBING,
+                        onFindBleClick = ::startFindingEsp32,
+                        onResetBleClick = ::resetConnection,
+                        nfcStatus = nfcStatus,
+                        vehicleIdHex = vehicleId?.let(::formatHex),
+                        masterKeyHex = masterSecretKey?.let(::formatHex),
+                        hmacResultHex = hmacResultHex,
+                        onSimulateNfcClick = ::simulateMasterCardRead,
+                        onStartNfcClick = ::startNfcReader,
+                        onTestHmacClick = ::testHmacVerification,
                         modifier = Modifier.padding(innerPadding)
                     )
                 }
@@ -568,48 +651,166 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-private fun ScanScreen(
+private fun SmartKeyMainScreen(
     bleState: BleState,
-    status: String,
+    bleStatus: String,
     rttMs: Double?,
-    isBusy: Boolean,
-    onFindClick: () -> Unit,
-    onResetClick: () -> Unit,
+    isBleBusy: Boolean,
+    onFindBleClick: () -> Unit,
+    onResetBleClick: () -> Unit,
+    nfcStatus: String,
+    vehicleIdHex: String?,
+    masterKeyHex: String?,
+    hmacResultHex: String?,
+    onSimulateNfcClick: () -> Unit,
+    onStartNfcClick: () -> Unit,
+    onTestHmacClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
-    Column(modifier = modifier.padding(16.dp)) {
+    val scrollState = rememberScrollState()
+
+    Column(
+        modifier = modifier
+            .fillMaxSize()
+            .verticalScroll(scrollState)
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(16.dp)
+    ) {
         Text(
-            text = "BLE State: ${bleState.name}",
-            style = MaterialTheme.typography.titleMedium,
+            text = "Smart Key Access (CCC-Inspired)",
+            style = MaterialTheme.typography.headlineSmall,
             fontWeight = FontWeight.Bold
         )
-        Spacer(modifier = Modifier.height(8.dp))
-        Text(text = "Status: $status")
 
-        if (rttMs != null) {
-            Spacer(modifier = Modifier.height(8.dp))
-            Text(
-                text = "OTA Round-Trip Time (RTT): ${String.format(Locale.US, "%.2f", rttMs)} ms",
-                fontWeight = FontWeight.Bold,
-                color = MaterialTheme.colorScheme.primary
-            )
-        }
-
-        Spacer(modifier = Modifier.height(16.dp))
-
-        Button(
-            onClick = onFindClick,
-            enabled = !isBusy
+        // CARD 1: NFC Master Card Provisioning (diagram_do_an-Trang-2.drawio.png)
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
         ) {
-            Text(if (isBusy) "Busy..." else "Find ESP32")
+            Column(
+                modifier = Modifier.padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Text(
+                    text = "1. NFC Provisioning (Master Card)",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.primary
+                )
+                Text(
+                    text = "Trạng thái: $nfcStatus",
+                    style = MaterialTheme.typography.bodyMedium
+                )
+
+                if (vehicleIdHex != null && masterKeyHex != null) {
+                    Text(
+                        text = "VID: $vehicleIdHex",
+                        style = MaterialTheme.typography.bodySmall,
+                        fontFamily = FontFamily.Monospace
+                    )
+                    Text(
+                        text = "MSK: $masterKeyHex",
+                        style = MaterialTheme.typography.bodySmall,
+                        fontFamily = FontFamily.Monospace
+                    )
+                }
+
+                if (hmacResultHex != null) {
+                    Text(
+                        text = "HMAC Output (32B):\n$hmacResultHex",
+                        style = MaterialTheme.typography.bodySmall,
+                        fontFamily = FontFamily.Monospace,
+                        color = MaterialTheme.colorScheme.tertiary
+                    )
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Button(
+                        onClick = onSimulateNfcClick,
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text("Giả lập Card")
+                    }
+                    OutlinedButton(
+                        onClick = onStartNfcClick,
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text("Bật NFC")
+                    }
+                }
+
+                if (masterKeyHex != null) {
+                    Button(
+                        onClick = onTestHmacClick,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("Thử nghiệm HMAC-SHA256 (B2)")
+                    }
+                }
+            }
         }
 
-        if (bleState == BleState.DATA_READY || bleState == BleState.ERROR) {
-            Spacer(modifier = Modifier.height(8.dp))
-            Button(
-                onClick = onResetClick
+        // CARD 2: BLE Central GATT Pipeline (M1 Baseline)
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+        ) {
+            Column(
+                modifier = Modifier.padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                Text("Reset / Scan Again")
+                Text(
+                    text = "2. BLE Central Pipeline (M1 Baseline)",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.primary
+                )
+                Text(
+                    text = "UUID: 6E400001-B5A3-F393-E0A9-E50E24DCCA9E",
+                    style = MaterialTheme.typography.bodySmall,
+                    fontFamily = FontFamily.Monospace
+                )
+                Text(
+                    text = "BLE State: ${bleState.name}",
+                    fontWeight = FontWeight.SemiBold
+                )
+                Text(
+                    text = "Status: $bleStatus",
+                    style = MaterialTheme.typography.bodyMedium
+                )
+
+                if (rttMs != null) {
+                    Text(
+                        text = "OTA Round-Trip (RTT): ${String.format(Locale.US, "%.2f", rttMs)} ms",
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Button(
+                        onClick = onFindBleClick,
+                        enabled = !isBleBusy,
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text(if (isBleBusy) "Đang xử lý..." else "Tìm ESP32")
+                    }
+
+                    if (bleState == BleState.DATA_READY || bleState == BleState.ERROR) {
+                        OutlinedButton(
+                            onClick = onResetBleClick,
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text("Reset")
+                        }
+                    }
+                }
             }
         }
     }
@@ -617,15 +818,22 @@ private fun ScanScreen(
 
 @Preview(showBackground = true)
 @Composable
-private fun ScanScreenPreview() {
+private fun SmartKeyMainScreenPreview() {
     SmartKeyAccessTheme {
-        ScanScreen(
+        SmartKeyMainScreen(
             bleState = BleState.DATA_READY,
-            status = "PONG received! RTT = 24.50 ms",
+            bleStatus = "PONG received! RTT = 24.50 ms",
             rttMs = 24.5,
-            isBusy = false,
-            onFindClick = {},
-            onResetClick = {}
+            isBleBusy = false,
+            onFindBleClick = {},
+            onResetBleClick = {},
+            nfcStatus = "Đã nạp Master Card!",
+            vehicleIdHex = "5649445F30303031",
+            masterKeyHex = "101112131415161718191A1B1C1D1E1F",
+            hmacResultHex = "A1B2C3D4E5F60102030405060708091011121314151617181920212223242526",
+            onSimulateNfcClick = {},
+            onStartNfcClick = {},
+            onTestHmacClick = {}
         )
     }
 }
