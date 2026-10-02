@@ -413,7 +413,7 @@ class MainActivity : ComponentActivity() {
 
         val started = try {
             // Request 512-byte MTU: Eliminates packet fragmentation for subsequent
-            // 65-byte uncompressed P-256 public keys (0x04 || X || Y) in Milestone M4.
+            // P-256 public keys in Milestone M4 (66 bytes in Mbed TLS TLS-ECPoint: 0x41 || 0x04 || X || Y).
             gatt.requestMtu(512)
         } catch (_: SecurityException) {
             false
@@ -574,17 +574,17 @@ class MainActivity : ComponentActivity() {
             mtu: Int,
             status: Int
         ) {
-            // Minimum threshold: 65 bytes (NIST P-256 public key) + 3 bytes (ATT opcode and handle header)
+            // Minimum threshold: 66 bytes (Mbed TLS P-256 public key: 0x41 || 0x04 || X || Y) + 3 bytes (ATT opcode and handle header)
             if (
                 status == BluetoothGatt.GATT_SUCCESS &&
-                mtu >= 68
+                mtu >= 69
             ) {
                 runOnUiThread {
                     this@MainActivity.status = "MTU negotiated: $mtu bytes. Subscribing..."
                 }
                 subscribeToNotifications(gatt)
             } else {
-                failGatt("MTU negotiation failed or insufficient for P-256 keys ($mtu < 68)")
+                failGatt("MTU negotiation failed or insufficient for P-256 keys ($mtu < 69)")
             }
         }
 
