@@ -98,7 +98,7 @@ class MainActivity : ComponentActivity() {
     private var rttTelemetryMs by mutableStateOf<Double?>(null)
 
     // NFC Master Card Provisioning state (diagram_do_an-Trang-2.drawio.png)
-    private var nfcStatus by mutableStateOf("Chưa nạp Master Card")
+    private var nfcStatus by mutableStateOf("Master Card not provisioned")
     private var vehicleId by mutableStateOf<ByteArray?>(null)
     private var masterSecretKey by mutableStateOf<ByteArray?>(null)
     private var hmacResultHex by mutableStateOf<String?>(null)
@@ -198,21 +198,21 @@ class MainActivity : ComponentActivity() {
         ) // 16 bytes Master Secret Key
         vehicleId = simulatedVid
         masterSecretKey = simulatedMsk
-        nfcStatus = "Đã nạp Master Card!\nVID: ${formatHex(simulatedVid)} (8B)\nMSK: ${formatHex(simulatedMsk)} (16B)"
+        nfcStatus = "Master Card provisioned!\nVID: ${formatHex(simulatedVid)} (8B)\nMSK: ${formatHex(simulatedMsk)} (16B)"
         hmacResultHex = null
     }
 
     private fun startNfcReader() {
         val adapter = NfcAdapter.getDefaultAdapter(this)
         if (adapter == null) {
-            nfcStatus = "Thiết bị không có chip NFC phần cứng.\nVui lòng bấm 'Giả lập Master Card'."
+            nfcStatus = "Device lacks NFC hardware.\nPlease tap 'Simulate Card'."
             return
         }
         if (!adapter.isEnabled) {
-            nfcStatus = "NFC đang tắt. Hãy bật NFC trong Cài đặt hệ thống."
+            nfcStatus = "NFC is disabled. Please enable NFC in system settings."
             return
         }
-        nfcStatus = "NFC đang bật. Hãy áp thẻ Master Card vào lưng điện thoại..."
+        nfcStatus = "NFC active. Tap Master Card to the back of the device..."
     }
 
     private fun computeHmacSha256(key: ByteArray, data: ByteArray): ByteArray {
@@ -226,10 +226,10 @@ class MainActivity : ComponentActivity() {
         val msk = masterSecretKey
         val vid = vehicleId
         if (msk == null || vid == null) {
-            nfcStatus = "Lỗi: Cần nạp Master Card (VID + MSK) trước khi băm HMAC!"
+            nfcStatus = "Error: Master Card (VID + MSK) required before computing HMAC!"
             return
         }
-        // Giả lập nhận từ ESP32: vid (8 bytes) + nonce (16 bytes)
+        // Simulated challenge from ESP32: vid (8 bytes) + nonce (16 bytes)
         val simulatedNonce = byteArrayOf(
             0xA0.toByte(), 0xA1.toByte(), 0xA2.toByte(), 0xA3.toByte(),
             0xA4.toByte(), 0xA5.toByte(), 0xA6.toByte(), 0xA7.toByte(),
@@ -239,7 +239,7 @@ class MainActivity : ComponentActivity() {
         val payload = vid + simulatedNonce
         val hmac = computeHmacSha256(msk, payload)
         hmacResultHex = formatHex(hmac)
-        nfcStatus = "Tính HMAC-SHA256 thành công (32 bytes)!\nInput: VID (${vid.size}B) + Nonce (${simulatedNonce.size}B)\nKey: MSK (${msk.size}B)"
+        nfcStatus = "HMAC-SHA256 computed successfully (32 bytes)!\nInput: VID (${vid.size}B) + Nonce (${simulatedNonce.size}B)\nKey: MSK (${msk.size}B)"
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -698,7 +698,7 @@ private fun SmartKeyMainScreen(
                     color = MaterialTheme.colorScheme.primary
                 )
                 Text(
-                    text = "Trạng thái: $nfcStatus",
+                    text = "Status: $nfcStatus",
                     style = MaterialTheme.typography.bodyMedium
                 )
 
@@ -732,13 +732,13 @@ private fun SmartKeyMainScreen(
                         onClick = onSimulateNfcClick,
                         modifier = Modifier.weight(1f)
                     ) {
-                        Text("Giả lập Card")
+                        Text("Simulate Card")
                     }
                     OutlinedButton(
                         onClick = onStartNfcClick,
                         modifier = Modifier.weight(1f)
                     ) {
-                        Text("Bật NFC")
+                        Text("Enable NFC")
                     }
                 }
 
@@ -747,7 +747,7 @@ private fun SmartKeyMainScreen(
                         onClick = onTestHmacClick,
                         modifier = Modifier.fillMaxWidth()
                     ) {
-                        Text("Thử nghiệm HMAC-SHA256 (B2)")
+                        Text("Test HMAC-SHA256 (Step 2)")
                     }
                 }
             }
@@ -799,7 +799,7 @@ private fun SmartKeyMainScreen(
                         enabled = !isBleBusy,
                         modifier = Modifier.weight(1f)
                     ) {
-                        Text(if (isBleBusy) "Đang xử lý..." else "Tìm ESP32")
+                        Text(if (isBleBusy) "Busy..." else "Find ESP32")
                     }
 
                     if (bleState == BleState.DATA_READY || bleState == BleState.ERROR) {
@@ -827,7 +827,7 @@ private fun SmartKeyMainScreenPreview() {
             isBleBusy = false,
             onFindBleClick = {},
             onResetBleClick = {},
-            nfcStatus = "Đã nạp Master Card!",
+            nfcStatus = "Master Card provisioned!",
             vehicleIdHex = "5649445F30303031",
             masterKeyHex = "101112131415161718191A1B1C1D1E1F",
             hmacResultHex = "A1B2C3D4E5F60102030405060708091011121314151617181920212223242526",
