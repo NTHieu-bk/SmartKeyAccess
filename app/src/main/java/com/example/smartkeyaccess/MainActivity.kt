@@ -72,6 +72,7 @@ enum class BleState {
     DISCOVERING,
     MTU_NEGOTIATING,
     SUBSCRIBING,
+    PIPE_TESTING,
     DATA_READY,
     ERROR
 }
@@ -96,6 +97,7 @@ class MainActivity : ComponentActivity() {
     private var scanning by mutableStateOf(false)
     private var status by mutableStateOf("Ready to find ESP32")
     private var rttTelemetryMs by mutableStateOf<Double?>(null)
+    private var negotiatedMtu by mutableStateOf(23)
 
     // NFC Master Card Provisioning state (diagram_do_an-Trang-2.drawio.png)
     private var nfcStatus by mutableStateOf("Master Card not provisioned")
@@ -112,13 +114,23 @@ class MainActivity : ComponentActivity() {
     private var notifyCharacteristic: BluetoothGattCharacteristic? = null
 
     /**
-     * Test vectors for Milestone M1 OTA baseline validation.
+     * Test vectors for Milestone M1 BLE GATT baseline validation.
      * Verifies bi-directional pipe throughput before introducing crypto (M4) and UWB ranging (M2/M3).
      */
     private val PING = "PING".encodeToByteArray()
     private val PONG = "PONG".encodeToByteArray()
     private var pingStartNs: Long = 0L
     private var pingPending = false
+
+    /**
+     * Guard against dropped packets or unresponsive peripheral during PING/PONG pipe test.
+     */
+    private val pingTimeout = Runnable {
+        if (pingPending) {
+            pingPending = false
+            failGatt("PING timeout: No PONG received within 2000ms")
+        }
+    }
 
     /**
      * Scan timeout guard: Prevents battery depletion and radio lockup if target device is out of range.
@@ -252,7 +264,8 @@ class MainActivity : ComponentActivity() {
                         bleState = bleState,
                         bleStatus = status,
                         rttMs = rttTelemetryMs,
-                        isBleBusy = scanning || bleState == BleState.CONNECTING || bleState == BleState.DISCOVERING || bleState == BleState.MTU_NEGOTIATING || bleState == BleState.SUBSCRIBING,
+                        negotiatedMtu = negotiatedMtu,
+                        isBleBusy = scanning || bleState == BleState.CONNECTING || bleState == BleState.DISCOVERING || bleState == BleState.MTU_NEGOTIATING || bleState == BleState.SUBSCRIBING || bleState == BleState.PIPE_TESTING,
                         onFindBleClick = ::startFindingEsp32,
                         onResetBleClick = ::resetConnection,
                         nfcStatus = nfcStatus,
@@ -346,6 +359,7 @@ class MainActivity : ComponentActivity() {
      * Prevents Android OS connection table exhaustion (BluetoothGatt handle leak).
      */
     private fun cleanupGatt() {
+        handler.removeCallbacks(pingTimeout)
         val gatt = bluetoothGatt
         bluetoothGatt = null
 
@@ -377,6 +391,7 @@ class MainActivity : ComponentActivity() {
         cleanupGatt()
         targetDevice = null
         rttTelemetryMs = null
+        negotiatedMtu = 23
         bleState = BleState.READY
         status = "Ready to find ESP32"
     }
@@ -408,19 +423,24 @@ class MainActivity : ComponentActivity() {
     private fun requestMtu(gatt: BluetoothGatt) {
         runOnUiThread {
             bleState = BleState.MTU_NEGOTIATING
-            status = "Negotiating MTU (512 bytes)..."
+            status = "Negotiating MTU (requesting 512 bytes)..."
         }
 
         val started = try {
-            // Request 512-byte MTU: Eliminates packet fragmentation for subsequent
-            // P-256 public keys in Milestone M4 (66 bytes in Mbed TLS TLS-ECPoint: 0x41 || 0x04 || X || Y).
+            // Request 512-byte MTU: Informs Android and peripheral of our preferred capacity.
+            // On Android 14+, the Bluetooth stack initiates an exchange with 517 bytes.
+            // The final negotiated MTU will be reported asynchronously via onMtuChanged().
             gatt.requestMtu(512)
         } catch (_: SecurityException) {
             false
         }
 
         if (!started) {
-            failGatt("Failed to request MTU")
+            // Graceful fallback: Do not fail connection. Default ATT MTU (23 bytes) is sufficient for M1 PING/PONG.
+            runOnUiThread {
+                status = "MTU request not started, continuing with default 23 bytes..."
+            }
+            subscribeToNotifications(gatt)
         }
     }
 
@@ -474,12 +494,15 @@ class MainActivity : ComponentActivity() {
             return
         }
 
-        // Monotonic hardware clock immune to system wall-clock adjustments (NTP/time zones)
         pingStartNs = SystemClock.elapsedRealtimeNanos()
         pingPending = true
 
+        // Enforce 2000ms timeout for bidirectional pipe test
+        handler.removeCallbacks(pingTimeout)
+        handler.postDelayed(pingTimeout, 2_000L)
+
         runOnUiThread {
-            status = "Data pipe ready. Sending PING to ESP32..."
+            status = "Testing data pipe: Sending PING (4B) to ESP32..."
         }
 
         val result = try {
@@ -494,6 +517,7 @@ class MainActivity : ComponentActivity() {
 
         if (result != BluetoothStatusCodes.SUCCESS) {
             pingPending = false
+            handler.removeCallbacks(pingTimeout)
             failGatt("writeCharacteristic PING failed (code $result)")
         }
     }
@@ -574,18 +598,14 @@ class MainActivity : ComponentActivity() {
             mtu: Int,
             status: Int
         ) {
-            // Minimum threshold: 66 bytes (Mbed TLS P-256 public key: 0x41 || 0x04 || X || Y) + 3 bytes (ATT opcode and handle header)
-            if (
-                status == BluetoothGatt.GATT_SUCCESS &&
-                mtu >= 69
-            ) {
-                runOnUiThread {
-                    this@MainActivity.status = "MTU negotiated: $mtu bytes. Subscribing..."
-                }
-                subscribeToNotifications(gatt)
-            } else {
-                failGatt("MTU negotiation failed or insufficient for P-256 keys ($mtu < 69)")
+            val actualMtu = if (status == BluetoothGatt.GATT_SUCCESS) mtu else 23
+            runOnUiThread {
+                negotiatedMtu = actualMtu
+                this@MainActivity.status = "MTU negotiated: $actualMtu bytes. Subscribing to notifications..."
             }
+            // Do NOT fail GATT if MTU is small. Baseline M1 only needs 4 bytes for PING/PONG.
+            // Higher layer (M4 Crypto) will inspect negotiatedMtu to decide direct vs fragmented transmission.
+            subscribeToNotifications(gatt)
         }
 
         override fun onDescriptorWrite(
@@ -598,8 +618,9 @@ class MainActivity : ComponentActivity() {
                 status == BluetoothGatt.GATT_SUCCESS
             ) {
                 runOnUiThread {
-                    bleState = BleState.DATA_READY
-                    this@MainActivity.status = "Notification subscribed. Measuring OTA RTT..."
+                    // Semantics: At this point, notifications are enabled, but data path is not yet verified.
+                    bleState = BleState.PIPE_TESTING
+                    this@MainActivity.status = "Notifications enabled. Testing bidirectional data pipe (PING -> PONG)..."
                 }
                 sendPing(gatt)
             } else {
@@ -612,9 +633,9 @@ class MainActivity : ComponentActivity() {
             characteristic: BluetoothGattCharacteristic,
             status: Int
         ) {
-            // Success here confirms physical transmission down to GATT stack, not remote application-level ACK
             if (status != BluetoothGatt.GATT_SUCCESS) {
                 pingPending = false
+                handler.removeCallbacks(pingTimeout)
                 failGatt("PING write failed with status $status")
             }
         }
@@ -634,10 +655,13 @@ class MainActivity : ComponentActivity() {
                 val endNs = SystemClock.elapsedRealtimeNanos()
                 val rtt = (endNs - pingStartNs) / 1_000_000.0
                 pingPending = false
+                handler.removeCallbacks(pingTimeout)
 
                 runOnUiThread {
+                    // Only transition to DATA_READY once PONG is verified over the air
+                    bleState = BleState.DATA_READY
                     rttTelemetryMs = rtt
-                    this@MainActivity.status = "PONG received! RTT = ${String.format(Locale.US, "%.2f", rtt)} ms"
+                    this@MainActivity.status = "PONG received! BLE GATT RTT = ${String.format(Locale.US, "%.2f", rtt)} ms"
                 }
             }
         }
@@ -655,6 +679,7 @@ private fun SmartKeyMainScreen(
     bleState: BleState,
     bleStatus: String,
     rttMs: Double?,
+    negotiatedMtu: Int,
     isBleBusy: Boolean,
     onFindBleClick: () -> Unit,
     onResetBleClick: () -> Unit,
@@ -778,13 +803,18 @@ private fun SmartKeyMainScreen(
                     fontWeight = FontWeight.SemiBold
                 )
                 Text(
+                    text = "Negotiated MTU: $negotiatedMtu bytes (Payload max: ${negotiatedMtu - 3}B)",
+                    style = MaterialTheme.typography.bodySmall,
+                    fontFamily = FontFamily.Monospace
+                )
+                Text(
                     text = "Status: $bleStatus",
                     style = MaterialTheme.typography.bodyMedium
                 )
 
                 if (rttMs != null) {
                     Text(
-                        text = "OTA Round-Trip (RTT): ${String.format(Locale.US, "%.2f", rttMs)} ms",
+                        text = "BLE GATT Round-Trip (RTT): ${String.format(Locale.US, "%.2f", rttMs)} ms",
                         fontWeight = FontWeight.Bold,
                         color = MaterialTheme.colorScheme.primary
                     )
@@ -822,8 +852,9 @@ private fun SmartKeyMainScreenPreview() {
     SmartKeyAccessTheme {
         SmartKeyMainScreen(
             bleState = BleState.DATA_READY,
-            bleStatus = "PONG received! RTT = 24.50 ms",
+            bleStatus = "PONG received! BLE GATT RTT = 24.50 ms",
             rttMs = 24.5,
+            negotiatedMtu = 512,
             isBleBusy = false,
             onFindBleClick = {},
             onResetBleClick = {},
