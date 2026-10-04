@@ -98,37 +98,49 @@ Mobile App và ESP32 bắt buộc phải dùng chung bộ UUID này để không
 
 ---
 
-## 3. CẤU TRÚC CODE VÀ TRÁCH NHIỆM TỪNG HÀM (`MainActivity.kt`)
+## 3. KIẾN TRÚC MÃ NGUỒN (MODULAR ARCHITECTURE)
 
-* **Khởi tạo và Điều phối quyền:**
-  - `hasPermission()`: Kiểm tra quyền runtime `BLUETOOTH_SCAN` và `BLUETOOTH_CONNECT` (Android 12+ / API 31+).
-  - `startFindingEsp32()`: Kiểm tra phần cứng BLE, adapter, kiểm tra Bluetooth bật/tắt và kích hoạt `startScan()`.
-  - `stopScan()`: Dừng quét an toàn, hủy runnable timeout 10 giây.
-* **Quản trị kết nối GATT & Vòng đời Radio:**
-  - `connectToTarget()`: Thực hiện kết nối trực tiếp (`autoConnect = false`) để giảm thiểu độ trễ bắt tay vô tuyến.
-  - `requestMtu(512)`: Thương lượng kích thước gói tin MTU tối đa để truyền trọn vẹn Public Key P-256 (65 bytes) không bị phân mảnh.
-  - `subscribeToNotifications()`: Đăng ký lắng nghe cục bộ và ghi giá trị `0x0001` lên CCCD của TX Characteristic trên ESP32.
-  - `sendPing()`: Ghi chuỗi byte `"PING"` xuống RX Characteristic, ghi nhận mốc thời gian nano-giây bằng `SystemClock.elapsedRealtimeNanos()`.
-  - `cleanupGatt()` & `failGatt()`: Giải phóng triệt để tài nguyên `BluetoothGatt`, ngăn chặn rò rỉ bảng kết nối hệ điều hành Android (tránh lỗi GATT Error 133).
-* **Module NFC & Mật mã:**
-  - `simulateMasterCardRead()`: Nạp test vector chuẩn VID (8B) và MSK (16B).
-  - `startNfcReader()`: Kiểm tra và kích hoạt lắng nghe chip NFC phần cứng.
-  - `computeHmacSha256(key, data)`: Sử dụng `javax.crypto.Mac` tính toán mã xác thực bản tin toàn vẹn 32 bytes.
-  - `testHmacVerification()`: Thực thi kịch bản giả lập nhận nonce từ ESP32 và băm đối chứng.
+Mã nguồn được tổ chức theo nguyên tắc phân tách trách nhiệm (Separation of Concerns):
+
+* **`MainActivity.kt` (BLE Central Pipeline & UI Controller):**
+  - **Quản lý quyền & phần cứng:** Kiểm tra `BLUETOOTH_SCAN`, `BLUETOOTH_CONNECT`, kích hoạt quét an toàn.
+  - **Quản trị vòng đời kết nối GATT:** Kết nối trực tiếp (`autoConnect = false`), phát hiện dịch vụ (`discoverServices`), thương lượng MTU 512 bytes.
+  - **Truyền nhận dữ liệu & Telemetry:** Đăng ký nhận thông báo CCCD `0x2902`, gửi gói `PING` (4 bytes), xác thực `PONG` (4 bytes) và tính toán độ trễ RTT (ms).
+  - **Quản trị NFC Reader:** Nút kích hoạt NFC hardware để sẵn sàng quét thẻ Master Card vật lý.
+
+* **`crypto/CryptoManager.kt` (Cryptographic Operations Provider):**
+  - **Tương thích 1:1 với Mbed TLS 3.x trên ESP32 (`Crypto.cpp`).**
+  - **SHA-256 Digest:** Băm dữ liệu với instance thread-safe cho BLE coroutines.
+  - **HMAC-SHA256:** Mã xác thực thông điệp phục vụ Challenge-Response (xác thực không lộ MSK).
+  - **ECDH NIST P-256:** Sinh cặp khóa tạm thời (ephemeral key pair) hỗ trợ Perfect Forward Secrecy.
+  - **TLS ECPoint Wire Format (66 bytes):** Đóng gói/giải mã khóa công khai dạng `0x41 || 0x04 || 32B X || 32B Y` khớp trực tiếp hàm `mbedtls_ecdh_make_public()`.
+  - **HKDF-SHA256 (RFC 5869):** Dẫn xuất khóa phiên đối xứng AES-128 (16 bytes) từ ECDH shared secret với chuỗi phân tách miền `"SmartKey-UWB-AES128-v1"`.
+
+* **`mock/MockDataProvider.kt` (Test Bench & Offline Fixtures):**
+  - Cách ly toàn bộ dữ liệu mẫu, test vector và thẻ giả lập phục vụ kiểm thử cục bộ mà không làm ô nhiễm Activity chính.
+  - Đồng bộ `CAR_ID` (`01 02 03 04 05 06 07 08`) và `MSK` (`01 02 ... 20`) khớp hoàn toàn với `global_variable.h` của ESP32.
 
 ---
 
-## 4. HƯỚNG DẪN BUILD VÀ CHẠY DỰ ÁN
+## 4. THÔNG SỐ GIAO TIẾP NFC HCE (CHO FIRMWARE ESP32 PN532)
+
+* **Application ID (AID):** `F0 53 4D 41 52 54 4B 45 59` (9 bytes: `0xF0` Proprietary prefix + `"SMARTKEY"`)
+* **Lệnh APDU Select AID:**
+  ```text
+  00 A4 04 00 09 F0 53 4D 41 52 54 4B 45 59 00
+  ```
+* **Mã phản hồi chuẩn (SW1-SW2):** `90 00` (Success).
+
+---
+
+## 5. HƯỚNG DẪN BUILD VÀ CHẠY DỰ ÁN
 
 ```bash
 # Di chuyển vào thư mục dự án
 cd "ĐACN/SmartKeyAccess"
 
 # Biên dịch ứng dụng (Debug APK)
-# Windows:
 .\gradlew.bat assembleDebug
-
-# Hoặc dùng Java trực tiếp nếu đường dẫn có dấu tiếng Việt:
-& java -jar .\gradle\wrapper\gradle-wrapper.jar assembleDebug
 ```
-File APK cài đặt sẽ xuất hiện tại: `app/build/outputs/apk/debug/app-debug.apk`.
+File APK cài đặt được xuất ra tại: `app/build/outputs/apk/debug/app-debug.apk`.
+

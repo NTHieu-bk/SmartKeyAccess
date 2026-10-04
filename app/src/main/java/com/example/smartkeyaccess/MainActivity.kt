@@ -54,10 +54,9 @@ import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.example.smartkeyaccess.ui.theme.SmartKeyAccessTheme
+import com.example.smartkeyaccess.crypto.CryptoManager
 import java.util.Locale
 import java.util.UUID
-import javax.crypto.Mac
-import javax.crypto.spec.SecretKeySpec
 
 /**
  * High-level lifecycle states of the BLE Central subsystem for Milestone M1.
@@ -99,11 +98,10 @@ class MainActivity : ComponentActivity() {
     private var rttTelemetryMs by mutableStateOf<Double?>(null)
     private var negotiatedMtu by mutableStateOf(23)
 
-    // NFC Master Card Provisioning state (diagram_do_an-Trang-2.drawio.png)
-    private var nfcStatus by mutableStateOf("Master Card not provisioned")
+    // NFC Master Card Provisioning state
+    private var nfcStatus by mutableStateOf("NFC Idle. Tap 'Enable NFC Reader' to scan Master Card...")
     private var vehicleId by mutableStateOf<ByteArray?>(null)
     private var masterSecretKey by mutableStateOf<ByteArray?>(null)
-    private var hmacResultHex by mutableStateOf<String?>(null)
 
     private val handler = Handler(Looper.getMainLooper())
     private var scanner: BluetoothLeScanner? = null
@@ -150,9 +148,9 @@ class MainActivity : ComponentActivity() {
                 val foundDevice = result.device
                 runOnUiThread {
                     if (scanning) {
-                        // Crucial: Stop scan immediately before initiating GATT connection.
-                        // Sharing the 2.4 GHz radio concurrently between scanning and connecting
-                        // triggers packet collisions and Android's internal GATT error 133.
+                        // Stop scanning before opening the GATT connection.
+                        // This reduces unnecessary BLE radio activity while the connection is established
+                        // and helps avoid connection instability observed on some Android devices.
                         stopScan()
                         targetDevice = foundDevice
                         bleState = BleState.FOUND
@@ -197,27 +195,10 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun formatHex(bytes: ByteArray): String =
-        bytes.joinToString("") { String.format("%02X", it) }
-
-    private fun simulateMasterCardRead() {
-        val simulatedVid = "VID_0001".toByteArray(Charsets.UTF_8) // 8 bytes Vehicle ID
-        val simulatedMsk = byteArrayOf(
-            0x10.toByte(), 0x11.toByte(), 0x12.toByte(), 0x13.toByte(),
-            0x14.toByte(), 0x15.toByte(), 0x16.toByte(), 0x17.toByte(),
-            0x18.toByte(), 0x19.toByte(), 0x1A.toByte(), 0x1B.toByte(),
-            0x1C.toByte(), 0x1D.toByte(), 0x1E.toByte(), 0x1F.toByte()
-        ) // 16 bytes Master Secret Key
-        vehicleId = simulatedVid
-        masterSecretKey = simulatedMsk
-        nfcStatus = "Master Card provisioned!\nVID: ${formatHex(simulatedVid)} (8B)\nMSK: ${formatHex(simulatedMsk)} (16B)"
-        hmacResultHex = null
-    }
-
     private fun startNfcReader() {
         val adapter = NfcAdapter.getDefaultAdapter(this)
         if (adapter == null) {
-            nfcStatus = "Device lacks NFC hardware.\nPlease tap 'Simulate Card'."
+            nfcStatus = "Device lacks NFC hardware."
             return
         }
         if (!adapter.isEnabled) {
@@ -225,33 +206,6 @@ class MainActivity : ComponentActivity() {
             return
         }
         nfcStatus = "NFC active. Tap Master Card to the back of the device..."
-    }
-
-    private fun computeHmacSha256(key: ByteArray, data: ByteArray): ByteArray {
-        val mac = Mac.getInstance("HmacSHA256")
-        val keySpec = SecretKeySpec(key, "HmacSHA256")
-        mac.init(keySpec)
-        return mac.doFinal(data)
-    }
-
-    private fun testHmacVerification() {
-        val msk = masterSecretKey
-        val vid = vehicleId
-        if (msk == null || vid == null) {
-            nfcStatus = "Error: Master Card (VID + MSK) required before computing HMAC!"
-            return
-        }
-        // Simulated challenge from ESP32: vid (8 bytes) + nonce (16 bytes)
-        val simulatedNonce = byteArrayOf(
-            0xA0.toByte(), 0xA1.toByte(), 0xA2.toByte(), 0xA3.toByte(),
-            0xA4.toByte(), 0xA5.toByte(), 0xA6.toByte(), 0xA7.toByte(),
-            0xA8.toByte(), 0xA9.toByte(), 0xAA.toByte(), 0xAB.toByte(),
-            0xAC.toByte(), 0xAD.toByte(), 0xAE.toByte(), 0xAF.toByte()
-        )
-        val payload = vid + simulatedNonce
-        val hmac = computeHmacSha256(msk, payload)
-        hmacResultHex = formatHex(hmac)
-        nfcStatus = "HMAC-SHA256 computed successfully (32 bytes)!\nInput: VID (${vid.size}B) + Nonce (${simulatedNonce.size}B)\nKey: MSK (${msk.size}B)"
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -269,12 +223,9 @@ class MainActivity : ComponentActivity() {
                         onFindBleClick = ::startFindingEsp32,
                         onResetBleClick = ::resetConnection,
                         nfcStatus = nfcStatus,
-                        vehicleIdHex = vehicleId?.let(::formatHex),
-                        masterKeyHex = masterSecretKey?.let(::formatHex),
-                        hmacResultHex = hmacResultHex,
-                        onSimulateNfcClick = ::simulateMasterCardRead,
+                        vehicleIdHex = vehicleId?.let(CryptoManager::toHex),
+                        masterKeyHex = masterSecretKey?.let(CryptoManager::toHex),
                         onStartNfcClick = ::startNfcReader,
-                        onTestHmacClick = ::testHmacVerification,
                         modifier = Modifier.padding(innerPadding)
                     )
                 }
@@ -427,9 +378,9 @@ class MainActivity : ComponentActivity() {
         }
 
         val started = try {
-            // Request 512-byte MTU: Informs Android and peripheral of our preferred capacity.
-            // On Android 14+, the Bluetooth stack initiates an exchange with 517 bytes.
-            // The final negotiated MTU will be reported asynchronously via onMtuChanged().
+            // Request a larger ATT MTU for future protocol messages.
+            // Android 14+ requests 517 bytes for the first MTU request.
+            // The negotiated value is delivered via onMtuChanged().
             gatt.requestMtu(512)
         } catch (_: SecurityException) {
             false
@@ -474,7 +425,7 @@ class MainActivity : ComponentActivity() {
         }
 
         val result = try {
-            // Enables notifications on the peripheral's GATT server hardware
+            // Enables notifications on the remote GATT server by writing the CCCD.
             gatt.writeDescriptor(
                 cccd,
                 BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
@@ -497,7 +448,7 @@ class MainActivity : ComponentActivity() {
         pingStartNs = SystemClock.elapsedRealtimeNanos()
         pingPending = true
 
-        // Enforce 2000ms timeout for bidirectional pipe test
+        // Bound the pipe test so a missing PONG cannot leave the state machine stuck.
         handler.removeCallbacks(pingTimeout)
         handler.postDelayed(pingTimeout, 2_000L)
 
@@ -535,7 +486,7 @@ class MainActivity : ComponentActivity() {
             ) {
                 bluetoothGatt = gatt
                 val started = try {
-                    // Pull peripheral attribute handle map into Android GATT cache before any read/write operations
+                    // Discover the remote GATT services before accessing characteristics.
                     gatt.discoverServices()
                 } catch (_: SecurityException) {
                     false
@@ -686,10 +637,7 @@ private fun SmartKeyMainScreen(
     nfcStatus: String,
     vehicleIdHex: String?,
     masterKeyHex: String?,
-    hmacResultHex: String?,
-    onSimulateNfcClick: () -> Unit,
     onStartNfcClick: () -> Unit,
-    onTestHmacClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val scrollState = rememberScrollState()
@@ -707,7 +655,7 @@ private fun SmartKeyMainScreen(
             fontWeight = FontWeight.Bold
         )
 
-        // CARD 1: NFC Master Card Provisioning (diagram_do_an-Trang-2.drawio.png)
+        // CARD 1: NFC Master Card Provisioning
         Card(
             modifier = Modifier.fillMaxWidth(),
             colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
@@ -740,40 +688,11 @@ private fun SmartKeyMainScreen(
                     )
                 }
 
-                if (hmacResultHex != null) {
-                    Text(
-                        text = "HMAC Output (32B):\n$hmacResultHex",
-                        style = MaterialTheme.typography.bodySmall,
-                        fontFamily = FontFamily.Monospace,
-                        color = MaterialTheme.colorScheme.tertiary
-                    )
-                }
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                Button(
+                    onClick = onStartNfcClick,
+                    modifier = Modifier.fillMaxWidth()
                 ) {
-                    Button(
-                        onClick = onSimulateNfcClick,
-                        modifier = Modifier.weight(1f)
-                    ) {
-                        Text("Simulate Card")
-                    }
-                    OutlinedButton(
-                        onClick = onStartNfcClick,
-                        modifier = Modifier.weight(1f)
-                    ) {
-                        Text("Enable NFC")
-                    }
-                }
-
-                if (masterKeyHex != null) {
-                    Button(
-                        onClick = onTestHmacClick,
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Text("Test HMAC-SHA256 (Step 2)")
-                    }
+                    Text("Enable NFC Reader")
                 }
             }
         }
@@ -858,13 +777,10 @@ private fun SmartKeyMainScreenPreview() {
             isBleBusy = false,
             onFindBleClick = {},
             onResetBleClick = {},
-            nfcStatus = "Master Card provisioned!",
-            vehicleIdHex = "5649445F30303031",
-            masterKeyHex = "101112131415161718191A1B1C1D1E1F",
-            hmacResultHex = "A1B2C3D4E5F60102030405060708091011121314151617181920212223242526",
-            onSimulateNfcClick = {},
-            onStartNfcClick = {},
-            onTestHmacClick = {}
+            nfcStatus = "NFC active. Tap Master Card to device...",
+            vehicleIdHex = "0102030405060708",
+            masterKeyHex = "0102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F20",
+            onStartNfcClick = {}
         )
     }
 }
