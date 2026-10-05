@@ -160,29 +160,7 @@ Do đó, phân hệ di động bắt buộc phải có khả năng:
 
 ## 6. Kiến trúc Mã nguồn Hiện tại
 
-```mermaid
-flowchart TD
-    UI["Jetpack Compose UI"]
-    Main["MainActivity"]
-    HCE["SmartKeyApduService"]
-    Bridge["NfcHceBridge"]
-    Crypto["CryptoManager"]
-    Mock["MockDataProvider"]
-
-    UI <--> Main
-
-    Main -->|BLE Central/GATT| ESP["ESP32 BLE Server"]
-
-    PN["ESP32 + PN532"] -->|Command APDU| HCE
-    HCE -->|Response APDU| PN
-
-    HCE --> Bridge
-    Main --> Bridge
-
-    HCE --> Crypto
-    HCE --> Mock
-    Mock --> Crypto
-```
+![Sơ đồ Kiến trúc Phân hệ Mobile](docs/images/architecture.png)
 
 ### Phân công trách nhiệm của các thành phần
 
@@ -235,34 +213,7 @@ Các giá trị này là dữ liệu thử nghiệm phục vụ kiểm thử c�
 
 ## 7. Máy Trạng thái Thời gian chạy BLE (BLE Runtime State Machine)
 
-```mermaid
-stateDiagram-v2
-    [*] --> READY : Khởi tạo Activity
-
-    READY --> SCANNING : Bấm "Find ESP32" (Kiểm tra BLE, xin quyền)
-
-    SCANNING --> FOUND : Phát hiện Service UUID mục tiêu
-    SCANNING --> ERROR : Quá thời gian 10s / Quét thất bại
-
-    FOUND --> CONNECTING : stopScan() rồi gọi connectGatt(autoConnect=false)
-
-    CONNECTING --> DISCOVERING : STATE_CONNECTED → discoverServices()
-    CONNECTING --> ERROR : Mất kết nối / Lỗi kết nối GATT
-
-    DISCOVERING --> MTU_NEGOTIATING : Tìm thấy Service và đủ cặp đặc tính RX/TX
-    DISCOVERING --> ERROR : Thiếu Service hoặc sai lệch thuộc tính
-
-    MTU_NEGOTIATING --> SUBSCRIBING : onMtuChanged hoặc fallback về mặc định
-
-    SUBSCRIBING --> PIPE_TESTING : Ghi thành công CCCD 0x2902
-    SUBSCRIBING --> ERROR : Ghi CCCD thất bại
-
-    PIPE_TESTING --> DATA_READY : Nhận được gói PONG phản hồi từ ESP32
-    PIPE_TESTING --> ERROR : Gửi PING thất bại / Hết thời gian chờ PONG (2s)
-
-    DATA_READY --> READY : Bấm nút "Reset"
-    ERROR --> READY : Bấm nút "Reset" để thử lại
-```
+![Máy Trạng thái Thời gian chạy BLE](docs/images/ble_state_machine.png)
 
 Trạng thái `DATA_READY` có ý nghĩa là đường truyền BLE hai chiều thuộc Milestone M1 đã được kiểm chứng hoạt động thành công qua gói tin `PONG`.  
 Trạng thái này **không đồng nghĩa** với việc quá trình xác thực mật mã, đo cự ly UWB hay cấp quyền truy cập xe đã hoàn tất.
@@ -327,28 +278,7 @@ INS_RECE_DATA  = 0x20    // Điện thoại gửi dữ liệu về ESP32
 
 ### 9.4 Hành vi APDU Hiện tại
 
-```mermaid
-sequenceDiagram
-    participant PN as ESP32 + PN532
-    participant HCE as SmartKeyApduService
-    participant C as CryptoManager
-    participant M as MockDataProvider
-
-    PN->>HCE: Lệnh SELECT AID (F0534D4152544B4559)
-    HCE->>C: Khởi tạo cặp khóa ECDH P-256 tạm thời
-    HCE-->>PN: 90 00 (Thành công)
-
-    PN->>HCE: SEND_DATA (0x10), P1=01, Payload: VID (8B) || Nonce (16B)
-    HCE->>M: Lấy khóa MSK mẫu của firmware
-    HCE->>C: Tính HMAC-SHA256(MSK, VID || Nonce)
-    HCE-->>PN: 90 00 (Thành công)
-
-    PN->>HCE: RECE_DATA (0x20), P1=01 (Yêu cầu nhận băm)
-    HCE-->>PN: Trả về <32B HMAC> || 90 00
-
-    PN->>HCE: RECE_DATA (0x20), P1=02 (Yêu cầu nhận khóa công khai)
-    HCE-->>PN: Trả về <32B Public Key> || 90 00
-```
+![Sơ đồ Tuần tự Trao đổi APDU qua NFC HCE](docs/images/nfc_hce_flow.png)
 
 > [!NOTE]
 > **Lưu ý tương thích bộ đệm firmware (`nfc.cpp`):**
