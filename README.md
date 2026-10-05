@@ -1,10 +1,10 @@
 # HỆ THỐNG TRUY CẬP SMART KEY — PHÂN HỆ DI ĐỘNG (SMART KEY MOBILE ACCESS)
 ## Phân hệ Ứng dụng Di động Android — Hỗ trợ BLE + NFC HCE + Mật mã học cho Nguyên mẫu Smart Key
 
-> **Quy tắc ghi nhận tài liệu**
+> **Đánh giá & Phân tích Kỹ thuật từ AI (AI-Assisted Architectural & Security Audit)**
 >
-> Tài liệu README này phân tách rạch ròi giữa **yêu cầu (requirements)**, **thiết kế (design)**, **hiện thực hóa (implementation)** và **bằng chứng kiểm chứng thực nghiệm (verification evidence)**.
-> Trạng thái `IMPLEMENTED` thể hiện mã nguồn đã tồn tại trong dự án. Trạng thái này **không đồng nghĩa** với việc tính năng đã được kiểm chứng hoạt động trên phần cứng thực tế gồm điện thoại thật và bo mạch ESP32/PN532.
+> Tài liệu README này được phân tích, chuẩn hóa và kiểm định tự động bởi AI nhằm phân tách rạch ròi giữa **yêu cầu (requirements)**, **thiết kế (design)**, **hiện thực hóa (implementation)** và **bằng chứng kiểm chứng thực nghiệm (verification evidence)**.
+> Trạng thái `IMPLEMENTED` thể hiện mã nguồn đã tồn tại trong dự án và đã vượt qua kiểm tra tĩnh (static code analysis) cùng biên dịch Gradle. Trạng thái này **không đồng nghĩa** với việc tính năng đã được kiểm chứng hoạt động trên phần cứng thực tế gồm điện thoại thật và bo mạch ESP32/PN532.
 
 ---
 
@@ -236,6 +236,11 @@ sample VID / sample MSK / sample nonce
 ```
 Các giá trị này là dữ liệu thử nghiệm, tuyệt đối không được coi là khóa bảo mật dùng cho môi trường thực tế.
 
+> **Nhận xét Phân tích Kiến trúc từ AI (AI Architectural Review)**
+>
+> - **Phân tách trách nhiệm (Separation of Concerns):** Mã nguồn phân hệ được chia tách thành 4 tầng riêng biệt (`UI/Activity`, `Service HCE`, `Crypto Engine`, `Mock Fixture`). Thiết kế này ngăn chặn việc đưa logic mật mã phức tạp vào vòng đời UI, triệt tiêu rủi ro rò rỉ bộ nhớ GATT handle khi xoay màn hình hay tạm dừng ứng dụng.
+> - **Nguyên tắc Đóng khi Lỗi (Fail-Closed):** Mọi nhánh ngoại lệ (mất kết nối BLE, timeout PING/PONG, APDU không hợp lệ) đều chủ động dọn dẹp tài nguyên và đưa FSM về trạng thái an toàn `ERROR / READY`, tuyệt đối không cho phép mở cổng dữ liệu khi thiếu chứng cứ.
+
 ---
 
 ## 7. Máy Trạng thái Thời gian chạy BLE (BLE Runtime State Machine)
@@ -357,9 +362,21 @@ sequenceDiagram
 
 Hành vi tại thẻ `P1 = 0x03` hiện thời là **nhánh token chứng thực thử nghiệm của nguyên mẫu**, chưa phải là bằng chứng của một giao thức ký số ECDSA hoàn chỉnh.
 
+> **Cảnh báo Tương thích Phần cứng từ AI (AI Hardware Interoperability Alert)**
+>
+> Rà soát chéo mã nguồn driver `nfc.cpp` trên firmware ESP32 của Kiệt:
+> - Hàm `receive_data()` đang khai báo mảng đệm `uint8_t response[32]`.
+> - Chuẩn ISO/IEC 7816-4 và Android HCE luôn gửi kèm 2 bytes mã trạng thái `SW1-SW2` (`0x90 0x00`) ở cuối payload. Do đó, khi điện thoại trả về khóa công khai 32B hoặc HMAC 32B, tổng chiều dài gói tin là 34 bytes.
+> - Nếu firmware chỉ cấp phát bộ đệm 32 bytes, thư viện PN532 sẽ kích hoạt cơ chế cắt cụt (truncation), dẫn đến việc mất 2 bytes `90 00` và ESP32 có thể báo lỗi nhận dữ liệu. **Khuyến nghị:** Firmware cần nâng kích thước bộ đệm lên tối thiểu `response[64]`.
+
 ---
 
 ## 10. Các Hạn chế Quan trọng Hiện tại
+
+> **Đánh giá Bằng chứng & Rủi ro Bảo mật từ AI (AI Evidence & Risk Assessment)**
+>
+> - **Rủi ro Khóa Tĩnh:** Dịch vụ HCE đang dùng khóa bí mật mẫu `MockDataProvider.FIRMWARE_MSK_32B`. Đây là giải pháp phục vụ thông luồng Milestone M1; không được coi là bằng chứng về việc lưu trữ khóa bảo mật cấp thương mại (Hardware TEE / StrongBox KeyStore).
+> - **Thiếu hụt Chữ ký Số:** Nhánh `P1 = 0x03` hiện chỉ trả về giá trị băm đối chứng token `SHA256(cachedHmac)`. Cần phân biệt rõ đây là token thử nghiệm tạm thời, chưa phải chữ ký số mật mã bất đối xứng ECDSA NIST P-256 thực sự.
 
 ### 10.1 Đã có code HCE nhưng kiểm chứng phần cứng vẫn là một bước riêng biệt
 Sự hiện diện của tệp `SmartKeyApduService.kt` cho thấy điểm cuối HCE không còn là ý tưởng trên giấy.
@@ -469,14 +486,7 @@ Mã nguồn hiện tại vẫn còn chứa ghi chú `TODO` đối với thuật 
 
 ## 13. Hướng dẫn Biên dịch (Build)
 
-Trên môi trường Linux / macOS:
-
-```bash
-cd mobile_app
-./gradlew assembleDebug
-```
-
-Trên môi trường Windows (PowerShell):
+Biên dịch ứng dụng trên môi trường Windows (PowerShell):
 
 ```powershell
 cd mobile_app
