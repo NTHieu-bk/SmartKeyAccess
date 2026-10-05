@@ -53,8 +53,14 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
 import com.example.smartkeyaccess.ui.theme.SmartKeyAccessTheme
 import com.example.smartkeyaccess.crypto.CryptoManager
+import com.example.smartkeyaccess.mock.MockDataProvider
+import com.example.smartkeyaccess.nfc.NfcHceBridge
+import kotlinx.coroutines.launch
 import java.util.Locale
 import java.util.UUID
 
@@ -205,12 +211,32 @@ class MainActivity : ComponentActivity() {
             nfcStatus = "NFC is disabled. Please enable NFC in system settings."
             return
         }
-        nfcStatus = "NFC active. Tap Master Card to the back of the device..."
+        nfcStatus = "NFC active. Hold phone near PN532 reader..."
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+
+        // Observe NFC HCE telemetry events and provisioned credentials from background service
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                launch {
+                    NfcHceBridge.eventFlow.collect { event ->
+                        nfcStatus = event
+                    }
+                }
+                launch {
+                    NfcHceBridge.provisionedVehicleId.collect { vid ->
+                        if (vid != null) {
+                            vehicleId = vid
+                            masterSecretKey = MockDataProvider.FIRMWARE_MSK_32B
+                        }
+                    }
+                }
+            }
+        }
+
         setContent {
             SmartKeyAccessTheme {
                 Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
