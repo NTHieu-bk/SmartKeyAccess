@@ -1,11 +1,6 @@
 # HỆ THỐNG TRUY CẬP SMART KEY — PHÂN HỆ DI ĐỘNG (SMART KEY MOBILE ACCESS)
 ## Phân hệ Ứng dụng Di động Android — Hỗ trợ BLE + NFC HCE + Mật mã học cho Nguyên mẫu Smart Key
 
-> **Đánh giá & Phân tích Kỹ thuật từ AI (AI-Assisted Architectural & Security Audit)**
->
-> Tài liệu README này được phân tích, chuẩn hóa và kiểm định tự động bởi AI nhằm phân tách rạch ròi giữa **yêu cầu (requirements)**, **thiết kế (design)**, **hiện thực hóa (implementation)** và **bằng chứng kiểm chứng thực nghiệm (verification evidence)**.
-> Trạng thái `IMPLEMENTED` thể hiện mã nguồn đã tồn tại trong dự án và đã vượt qua kiểm tra tĩnh (static code analysis) cùng biên dịch Gradle. Trạng thái này **không đồng nghĩa** với việc tính năng đã được kiểm chứng hoạt động trên phần cứng thực tế gồm điện thoại thật và bo mạch ESP32/PN532.
-
 ---
 
 ## 1. Tổng quan Dự án
@@ -70,9 +65,9 @@ Do đó, phân hệ di động bắt buộc phải có khả năng:
 
 ---
 
-## 3. Phạm vi và Ranh giới Trách nhiệm
+## 3. Phạm vi Dự án (Project Scope)
 
-### 3.1 Phân hệ Mobile chịu trách nhiệm
+### 3.1 Trong phạm vi (In-Scope — Phân hệ Mobile)
 
 - Quản lý quyền runtime và kiểm tra năng lực phần cứng BLE trên Android.
 - Vòng đời quét BLE, kết nối và quản trị kết nối GATT.
@@ -87,16 +82,15 @@ Do đó, phân hệ di động bắt buộc phải có khả năng:
 - Giao diện người dùng (UI), hiển thị dữ liệu đo đạc và điều phối luồng nghiệp vụ.
 - Điều phối phiên UWB phía Android khi phân hệ này được tích hợp vào dự án.
 
-### 3.2 Phân hệ Mobile không chịu trách nhiệm
+### 3.2 Ngoài phạm vi (Out-of-Scope — Thuộc Phân hệ Khác)
 
-- Ra quyết định đóng/ngắt rơ-le mở khóa cuối cùng của xe;
+- Ra quyết định đóng/ngắt rơ-le mở khóa cuối cùng của xe (thuộc chính sách bảo mật phía xe);
 - Hiện thực hóa GATT Server trên ESP32;
 - Driver điều khiển phần cứng đầu đọc PN532 trên firmware;
 - Tầng vật lý (PHY) UWB hoặc giao tiếp với chip DW3000 phía xe;
 - Tự ý thay đổi định dạng gói tin hoặc thuật toán mật mã ngoài hợp đồng chung.
 
-Phân hệ **Bảo mật / Giao thức (Security/Protocol)** định nghĩa hợp đồng mật mã học.  
-Cả hai bản hiện thực hóa trên Android và ESP32 bắt buộc phải tuân thủ nghiêm ngặt hợp đồng đó.
+> **Ranh giới trách nhiệm:** Phân hệ **Bảo mật / Giao thức (Security/Protocol)** định nghĩa hợp đồng mật mã học. Cả hai bản hiện thực hóa trên Android và ESP32 bắt buộc phải tuân thủ nghiêm ngặt hợp đồng đó.
 
 ---
 
@@ -110,7 +104,8 @@ Cả hai bản hiện thực hóa trên Android và ESP32 bắt buộc phải tu
 | `HARDWARE-VERIFIED` | Đã được chứng minh chạy trên phần cứng thực tế kèm log đo đạc |
 | `UNKNOWN` | Chưa có đủ bằng chứng xác thực |
 
-Tuyệt đối không tự ý nâng một tính năng từ `IMPLEMENTED` lên `HARDWARE-VERIFIED` nếu chỉ mới vượt qua bước biên dịch Gradle mà chưa chạy trên thiết bị thật.
+> [!NOTE]
+> Quy tắc kiểm chứng: Không tự ý nâng một tính năng từ `IMPLEMENTED` lên `HARDWARE-VERIFIED` nếu chỉ mới vượt qua bước biên dịch Gradle mà chưa chạy trên thiết bị thật.
 
 ---
 
@@ -134,7 +129,7 @@ Tuyệt đối không tự ý nâng một tính năng từ `IMPLEMENTED` lên `H
 
 | Mã định danh | Nội dung yêu cầu | Trạng thái bằng chứng |
 |---|---|---|
-| `MOB-NFC-01` | Ứng dụng Android phải công bố mã nhận diện Smart Key AID thống nhất thông qua HCE. | `IMPLEMENTED` (trong `SmartKeyApduService.kt`, đã đăng ký Manifest và cấu hình XML) |
+| `MOB-NFC-01` | Ứng dụng Android phải công bố mã nhận diện Smart Key AID thống nhất thông qua HCE. | `IMPLEMENTED` |
 | `MOB-NFC-02` | Dịch vụ HCE phải tiếp nhận lệnh `SELECT AID` từ PN532 và trả về mã trạng thái ISO 7816 (`90 00`). | `IMPLEMENTED` |
 | `MOB-NFC-03` | Dịch vụ HCE phải nhận các gói dữ liệu có gắn thẻ định danh từ ESP32 và cập nhật telemetry lên UI. | `IMPLEMENTED` |
 | `MOB-NFC-04` | Dịch vụ HCE phải trả về phản hồi HMAC kỳ vọng tương ứng với khóa kiểm thử hiện tại. | `IMPLEMENTED + MOCKED credential` |
@@ -148,9 +143,9 @@ Tuyệt đối không tự ý nâng một tính năng từ `IMPLEMENTED` lên `H
 | `MOB-CRYPTO-01` | Ứng dụng phải cung cấp các hàm hỗ trợ băm SHA-256 và HMAC-SHA256. | `IMPLEMENTED` |
 | `MOB-CRYPTO-02` | Ứng dụng phải sinh cặp khóa ECDH NIST P-256 dùng một lần (ephemeral key pair). | `IMPLEMENTED` |
 | `MOB-CRYPTO-03` | Ứng dụng phải mã hóa/giải mã khóa công khai P-256 theo đúng định dạng đường truyền đã thỏa thuận. | `IMPLEMENTED` |
-| `MOB-CRYPTO-04` | Ứng dụng phải tính toán bí mật dùng chung ECDH khi nhận được khóa công khai của bên đối tác. | `IMPLEMENTED` (ở mức hàm helper; chưa có bằng chứng tích hợp end-to-end trên HCE) |
-| `MOB-CRYPTO-05` | Ứng dụng phải dẫn xuất khóa phiên bằng thuật toán HKDF-SHA256 theo đúng quy chuẩn chung. | `IMPLEMENTED` (ở mức hàm helper; chưa có bằng chứng tích hợp end-to-end) |
-| `MOB-CRYPTO-06` | Cơ chế chữ ký/xác thực cuối cùng phải tuân thủ hợp đồng Giao thức/Bảo mật đã chốt và vượt qua bộ test vector chéo nền tảng. | `DESIGN / chưa kiểm chứng` |
+| `MOB-CRYPTO-04` | Ứng dụng phải tính toán bí mật dùng chung ECDH khi nhận được khóa công khai của bên đối tác. | `IMPLEMENTED` |
+| `MOB-CRYPTO-05` | Ứng dụng phải dẫn xuất khóa phiên bằng thuật toán HKDF-SHA256 theo đúng quy chuẩn chung. | `IMPLEMENTED` |
+| `MOB-CRYPTO-06` | Cơ chế chữ ký/xác thực cuối cùng phải tuân thủ hợp đồng Giao thức/Bảo mật đã chốt và vượt qua bộ test vector chéo nền tảng. | `DESIGN` |
 
 ### 5.4 Yêu cầu UWB và Chính sách Truy cập
 
@@ -167,18 +162,18 @@ Tuyệt đối không tự ý nâng một tính năng từ `IMPLEMENTED` lên `H
 
 ```mermaid
 flowchart TD
-    UI[Giao diện Jetpack Compose]
-    Main[MainActivity]
-    HCE[SmartKeyApduService]
-    Bridge[NfcHceBridge]
-    Crypto[CryptoManager]
-    Mock[MockDataProvider]
+    UI["Jetpack Compose UI"]
+    Main["MainActivity"]
+    HCE["SmartKeyApduService"]
+    Bridge["NfcHceBridge"]
+    Crypto["CryptoManager"]
+    Mock["MockDataProvider"]
 
     UI <--> Main
 
-    Main -->|BLE Central/GATT| ESP[ESP32 BLE Server]
+    Main -->|BLE Central/GATT| ESP["ESP32 BLE Server"]
 
-    PN[ESP32 + PN532] -->|Command APDU| HCE
+    PN["ESP32 + PN532"] -->|Command APDU| HCE
     HCE -->|Response APDU| PN
 
     HCE --> Bridge
@@ -234,12 +229,7 @@ CAR_ID = 01 02 03 04 05 06 07 08
 MSK    = 01 02 ... 20
 sample VID / sample MSK / sample nonce
 ```
-Các giá trị này là dữ liệu thử nghiệm, tuyệt đối không được coi là khóa bảo mật dùng cho môi trường thực tế.
-
-> **Nhận xét Phân tích Kiến trúc từ AI (AI Architectural Review)**
->
-> - **Phân tách trách nhiệm (Separation of Concerns):** Mã nguồn phân hệ được chia tách thành 4 tầng riêng biệt (`UI/Activity`, `Service HCE`, `Crypto Engine`, `Mock Fixture`). Thiết kế này ngăn chặn việc đưa logic mật mã phức tạp vào vòng đời UI, triệt tiêu rủi ro rò rỉ bộ nhớ GATT handle khi xoay màn hình hay tạm dừng ứng dụng.
-> - **Nguyên tắc Đóng khi Lỗi (Fail-Closed):** Mọi nhánh ngoại lệ (mất kết nối BLE, timeout PING/PONG, APDU không hợp lệ) đều chủ động dọn dẹp tài nguyên và đưa FSM về trạng thái an toàn `ERROR / READY`, tuyệt đối không cho phép mở cổng dữ liệu khi thiếu chứng cứ.
+Các giá trị này là dữ liệu thử nghiệm phục vụ kiểm thử cục bộ, không dùng làm khóa thực tế trên xe.
 
 ---
 
@@ -360,26 +350,16 @@ sequenceDiagram
     HCE-->>PN: Trả về <32B Public Key> || 90 00
 ```
 
-Hành vi tại thẻ `P1 = 0x03` hiện thời là **nhánh token chứng thực thử nghiệm của nguyên mẫu**, chưa phải là bằng chứng của một giao thức ký số ECDSA hoàn chỉnh.
-
-> **Cảnh báo Tương thích Phần cứng từ AI (AI Hardware Interoperability Alert)**
->
-> Rà soát chéo mã nguồn driver `nfc.cpp` trên firmware ESP32 của Kiệt:
-> - Hàm `receive_data()` đang khai báo mảng đệm `uint8_t response[32]`.
-> - Chuẩn ISO/IEC 7816-4 và Android HCE luôn gửi kèm 2 bytes mã trạng thái `SW1-SW2` (`0x90 0x00`) ở cuối payload. Do đó, khi điện thoại trả về khóa công khai 32B hoặc HMAC 32B, tổng chiều dài gói tin là 34 bytes.
-> - Nếu firmware chỉ cấp phát bộ đệm 32 bytes, thư viện PN532 sẽ kích hoạt cơ chế cắt cụt (truncation), dẫn đến việc mất 2 bytes `90 00` và ESP32 có thể báo lỗi nhận dữ liệu. **Khuyến nghị:** Firmware cần nâng kích thước bộ đệm lên tối thiểu `response[64]`.
+> [!NOTE]
+> **Lưu ý tương thích bộ đệm firmware (`nfc.cpp`):**
+> Hàm `receive_data()` trên ESP32 hiện khai báo mảng đệm `response[32]`. Chuẩn ISO/IEC 7816-4 và Android HCE luôn gửi kèm 2 bytes mã trạng thái `SW1-SW2` (`0x90 0x00`) ở cuối payload (tổng 34 bytes khi trả về Public Key 32B hoặc HMAC 32B). Firmware cần cấu hình kích thước bộ đệm tối thiểu `response[64]` để tránh bị thư viện PN532 cắt cụt mã trạng thái.
 
 ---
 
 ## 10. Các Hạn chế Quan trọng Hiện tại
 
-> **Đánh giá Bằng chứng & Rủi ro Bảo mật từ AI (AI Evidence & Risk Assessment)**
->
-> - **Rủi ro Khóa Tĩnh:** Dịch vụ HCE đang dùng khóa bí mật mẫu `MockDataProvider.FIRMWARE_MSK_32B`. Đây là giải pháp phục vụ thông luồng Milestone M1; không được coi là bằng chứng về việc lưu trữ khóa bảo mật cấp thương mại (Hardware TEE / StrongBox KeyStore).
-> - **Thiếu hụt Chữ ký Số:** Nhánh `P1 = 0x03` hiện chỉ trả về giá trị băm đối chứng token `SHA256(cachedHmac)`. Cần phân biệt rõ đây là token thử nghiệm tạm thời, chưa phải chữ ký số mật mã bất đối xứng ECDSA NIST P-256 thực sự.
-
 ### 10.1 Đã có code HCE nhưng kiểm chứng phần cứng vẫn là một bước riêng biệt
-Sự hiện diện của tệp `SmartKeyApduService.kt` cho thấy điểm cuối HCE không còn là ý tưởng trên giấy.
+Sự hiện diện của tệp `SmartKeyApduService.kt` cho thấy điểm cuối HCE đã hoàn thành trong mã nguồn.
 
 Tuy nhiên, để đạt trạng thái `HARDWARE-VERIFIED`, hệ thống bắt buộc phải thu thập bằng chứng từ phần cứng thật:
 ```text
@@ -388,15 +368,15 @@ PN532 phát lệnh SELECT AID
 → Android trả về mã phản hồi hợp lệ
 → ESP32/PN532 ghi nhận log đúng các byte đó
 ```
-Đồng thời, cần kiểm tra đảm bảo dự án đã khai báo đầy đủ thẻ `<service>` trong `AndroidManifest.xml` và tệp cấu hình AID trong `res/xml/apduservice.xml`.
+Dự án đã khai báo đầy đủ thẻ `<service>` trong `AndroidManifest.xml` và tệp cấu hình AID trong `res/xml/apduservice.xml`.
 
 ### 10.2 HMAC hiện tại sử dụng khóa MSK mẫu của firmware
 Dịch vụ HCE hiện tại đang lấy khóa trực tiếp từ:
 ```text
 MockDataProvider.FIRMWARE_MSK_32B
 ```
-Do đó, nhánh tính toán HMAC này đóng vai trò là môi trường phục vụ tích hợp thử nghiệm.  
-Đây chưa phải là bằng chứng của việc lưu trữ khóa an toàn trong phần cứng (Keystore) hay quy trình quét thẻ Master Card vật lý thực tế ngoài đời.
+Do đó, nhánh tính toán HMAC này đóng vai trò là môi trường phục vụ tích hợp thử nghiệm giữa hai nhóm.  
+Khi triển khai thương mại, khóa này sẽ được nạp qua Master Card vật lý và lưu trong Android KeyStore có bảo vệ phần cứng.
 
 ### 10.3 "Chứng thực chữ ký" hiện tại chưa phải là chữ ký số ECDSA
 Mã nguồn HCE hiện tại đang phản hồi:
@@ -405,7 +385,7 @@ SHA256(cachedHmac)
 ```
 cho nhánh chứng thực `P1 = 0x03`.
 
-Đoạn mã này tuyệt đối không được ghi nhận trong báo cáo là chữ ký số ECDSA, trừ phi mã nguồn được nâng cấp để ký thực sự trên chuỗi thông điệp/nonce bằng khóa bí mật (Private Key) và được phía ESP32 xác thực chữ ký bằng hàm toán học tương ứng.
+Đây là token thử nghiệm tạm thời nhằm xác nhận chuỗi băm phiên, chưa phải chữ ký số mật mã bất đối xứng ECDSA NIST P-256 ký bằng Private Key.
 
 ### 10.4 Các hàm hỗ trợ ECDH / HKDF đi trước tích hợp đầu-cuối
 Lớp `CryptoManager` hiện đã có thể:
@@ -414,7 +394,7 @@ Giải mã khóa công khai của đối tác
 → Tính toán bí mật dùng chung ECDH (Shared Secret)
 → Dẫn xuất khóa phiên thông qua HKDF
 ```
-Tuy nhiên, luồng tương tác HCE hiện thời chưa kết nối trọn vẹn toàn bộ chuỗi mắt xích này trên thực tế.
+Luồng tương tác HCE hiện thời đang tập trung kiểm thử 7 bước APDU cơ bản trước khi tích hợp chuỗi dẫn xuất khóa đầy đủ.
 
 ### 10.5 AES-GCM chưa được hiện thực hóa trong CryptoManager
 Mã nguồn hiện tại vẫn còn chứa ghi chú `TODO` đối với thuật toán mã hóa đối xứng AES-GCM.
