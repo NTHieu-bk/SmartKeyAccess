@@ -10,13 +10,26 @@ import kotlinx.coroutines.flow.asStateFlow
 import java.security.KeyPair
 import java.security.interfaces.ECPublicKey
 
-// Shared bridge forwarding NFC HCE protocol lifecycle events to Jetpack Compose UI
+/*
+ * Small bridge between the background HostApduService and MainActivity/Compose.
+ *
+ * HostApduService is created and called by Android when PN532 sends APDU commands, so it is not safe to
+ * assume MainActivity is the object directly handling the NFC transaction. I keep only simple StateFlow
+ * values here so the UI can observe what happened (AID selected, HMAC sent, signature sent, etc.).
+ */
 object NfcHceBridge {
     private val _eventFlow = MutableStateFlow("NFC HCE Standby (Listening for PN532)")
     val eventFlow: StateFlow<String> = _eventFlow.asStateFlow()
 
     private val _provisionedVehicleId = MutableStateFlow<ByteArray?>(null)
     val provisionedVehicleId: StateFlow<ByteArray?> = _provisionedVehicleId.asStateFlow()
+
+    /*
+     * Long-term Phone Identity key pair used for ECDSA enrollment.
+     * CryptoManager stores this key under AndroidKeyStore, therefore the key does not silently change every
+     * time the app process restarts. This is important because ESP32 can store ID_PUBLIC in NVS.
+     */
+    val phoneIdentityKeyPair: KeyPair by lazy { CryptoManager.getOrCreateIdentityKeyPair() }
 
     fun updateEvent(event: String) {
         _eventFlow.value = event
@@ -27,7 +40,18 @@ object NfcHceBridge {
     }
 }
 
-// Host Card Emulation service handling Kiệt's 7 APDU commands from PN532 firmware
+/*
+ * Android HCE side of the NFC protocol.
+ *
+ * Mental model used in this project:
+ *   ESP32 + PN532 = reader / initiator
+ *   Android phone = HCE card / responder
+ *
+ * Therefore the phone does not randomly push an NFC packet by itself. PN532 first sends a command APDU,
+ * Android calls processCommandApdu(), and this function returns the response APDU. The INS/P1 values below
+ * intentionally follow Kiệt's existing firmware contract so the two sides can be tested without rewriting
+ * APDU commands that already worked before.
+ */
 class SmartKeyApduService : HostApduService() {
 
     companion object {
@@ -36,6 +60,8 @@ class SmartKeyApduService : HostApduService() {
         private val SW_INS_NOT_SUPPORTED = byteArrayOf(0x6D.toByte(), 0x00.toByte())
         private val SW_WRONG_LENGTH = byteArrayOf(0x67.toByte(), 0x00.toByte())
         private val SW_UNKNOWN_ERROR = byteArrayOf(0x6F.toByte(), 0x00.toByte())
+        // 69 85 = command cannot be executed because the expected previous protocol step has not happened.
+        private val SW_CONDITIONS_NOT_SATISFIED = byteArrayOf(0x69.toByte(), 0x85.toByte())
 
         // Application Identifier: F0 53 4D 41 52 54 4B 45 59 (0xF0 + "SMARTKEY")
         private val TARGET_AID = CryptoManager.fromHex("F0534D4152544B4559")
@@ -51,8 +77,14 @@ class SmartKeyApduService : HostApduService() {
         private const val TAG_NONCE_OR_SIG: Byte = 0x03.toByte()
     }
 
-    private var cachedHmac = ByteArray(32)
-    private var ephemeralKeyPair: KeyPair? = null
+    /*
+     * These values belong to ONE NFC exchange only. They are deliberately kept separate from the long-term
+     * identity key in AndroidKeyStore. SELECT AID resets them so a new NFC tap cannot accidentally reuse an
+     * HMAC/signature from the previous tap.
+     */
+    private var cachedHmac: ByteArray? = null
+    private var cachedChallengeNonce: ByteArray? = null
+    private var cachedSignature: ByteArray? = null
     private var receivedEspKey: ByteArray? = null
 
     override fun processCommandApdu(commandApdu: ByteArray?, extras: Bundle?): ByteArray {
@@ -69,8 +101,14 @@ class SmartKeyApduService : HostApduService() {
                     commandApdu.copyOfRange(5, 5 + TARGET_AID.size).contentEquals(TARGET_AID)
 
             return if (isAidMatch) {
-                // Initialize fresh ephemeral ECDH key pair for this provisioning session
-                ephemeralKeyPair = CryptoManager.generateEcdhKeyPair()
+                // A SELECT starts a fresh logical NFC session for this simple project protocol.
+                // Clearing cached values prevents stale data from being returned if ESP32 sends commands
+                // in the wrong order during a later test. The persistent identity key is NOT cleared.
+                cachedHmac = null
+                cachedChallengeNonce = null
+                cachedSignature = null
+                receivedEspKey = null
+
                 NfcHceBridge.updateEvent("NFC HCE: Handshake OK with PN532 (AID Select)")
                 SW_SUCCESS
             } else {
@@ -96,14 +134,37 @@ class SmartKeyApduService : HostApduService() {
                     SW_SUCCESS
                 }
                 TAG_KEY -> {
-                    // Payload: Public key exported by ESP32 Mbed TLS
+                    /*
+                     * ESP32 public-key bytes are received and cached here because Kiệt's APDU table already
+                     * contains this step. In the current NFC milestone we do not run ECDH immediately with it;
+                     * the key is kept for the later secure-session integration once both sides freeze the exact
+                     * public-key wire format.
+                     */
                     receivedEspKey = payload
                     NfcHceBridge.updateEvent("NFC: Received ESP32 Public Key (${payload.size}B).")
                     SW_SUCCESS
                 }
                 TAG_NONCE_OR_SIG -> {
-                    // Payload: Challenge nonce for digital signature step
-                    NfcHceBridge.updateEvent("NFC: Received Signature Nonce (${payload.size}B).")
+                    /*
+                     * Digital-signature challenge from ESP32. The project flow is:
+                     *   ESP32 sends fresh nonce -> Phone signs nonce with ID_PRIVATE -> ESP32 later requests
+                     *   RECE_SIGNATURE and verifies it with the stored PHONE ID_PUBLIC.
+                     *
+                     * We sign as soon as the challenge arrives and cache the 64-byte P1363 signature. This is
+                     * useful during real NFC testing because if ESP32 repeats the RECEIVE command after a short
+                     * communication hiccup, the phone can return the same response for the same challenge.
+                     */
+                    if (payload.isEmpty()) {
+                        return SW_WRONG_LENGTH
+                    }
+
+                    cachedChallengeNonce = payload.copyOf()
+                    val privateKey = NfcHceBridge.phoneIdentityKeyPair.private
+                    cachedSignature = CryptoManager.signEcdsaP1363(privateKey, payload)
+
+                    NfcHceBridge.updateEvent(
+                        "NFC: Received Signature Challenge (${payload.size}B) and prepared ECDSA signature."
+                    )
                     SW_SUCCESS
                 }
                 else -> SW_INS_NOT_SUPPORTED
@@ -114,16 +175,31 @@ class SmartKeyApduService : HostApduService() {
         if (ins == INS_RECE_DATA) {
             return when (p1) {
                 TAG_VID_NONCE -> {
-                    // Kiệt calls RECE_HASH (P1 = 0x01): return 32-byte HMAC digest
+                    /*
+                     * Kiệt calls RECE_HASH (P1 = 0x01). We only return a hash if SEND_VID_NONCE happened in
+                     * this NFC session. Returning 32 zero bytes here would make a wrong command order look like
+                     * a valid protocol response, which is very confusing while debugging hardware.
+                     */
+                    val hmac = cachedHmac ?: return SW_CONDITIONS_NOT_SATISFIED
                     NfcHceBridge.updateEvent("NFC: Sent HMAC-SHA256 (32B) to ESP32.")
-                    cachedHmac + SW_SUCCESS
+                    hmac + SW_SUCCESS
                 }
                 TAG_KEY -> {
-                    // Kiệt calls RECE_KEY (P1 = 0x02): return phone public key
-                    val keyPair = ephemeralKeyPair ?: CryptoManager.generateEcdhKeyPair().also { ephemeralKeyPair = it }
-                    val pubKey = keyPair.public as ECPublicKey
+                    // Kiệt calls RECE_KEY (P1 = 0x02): return phone ID_PUBLIC key
+                    val pubKey = NfcHceBridge.phoneIdentityKeyPair.public as ECPublicKey
 
-                    // Adjust wire length to fit ESP32 buffer: 32B affine X or full 66B TLS point
+                    /*
+                     * Compatibility note with Kiệt's current APDU table:
+                     * RECE_KEY currently asks for a 32-byte value, so this branch preserves the old behavior
+                     * and returns the 32-byte affine-X coordinate. The complete uncompressed P-256 point needs
+                     * X and Y (65B ANSI or 66B mbedTLS/TLS ECPoint format), therefore before the final ESP32
+                     * ECDSA verification test the group still has to confirm exactly how Kiệt reconstructs or
+                     * stores PHONE ID_PUBLIC.
+                     *
+                     * I do NOT silently change this working APDU contract here because the existing firmware
+                     * commands are being used as the current integration baseline. If Le is not 32, the app
+                     * returns the full 66-byte format already supported by CryptoManager.
+                     */
                     val le = if (commandApdu.size >= 5) commandApdu[4].toInt() and 0xFF else 0
                     val keyBytes = if (le == 32) {
                         val rawX = pubKey.w.affineX.toByteArray()
@@ -138,14 +214,22 @@ class SmartKeyApduService : HostApduService() {
                         CryptoManager.encodeTlsEcPoint(pubKey)
                     }
 
-                    NfcHceBridge.updateEvent("NFC: Sent Public Key (${keyBytes.size}B) to ESP32.")
+                    NfcHceBridge.updateEvent("NFC: Sent ID_PUBLIC (${keyBytes.size}B) to ESP32.")
                     keyBytes + SW_SUCCESS
                 }
                 TAG_NONCE_OR_SIG -> {
-                    // Kiệt calls RECE_SIGNATURE (P1 = 0x03): return 32-byte cryptographic token proof
-                    val signatureProof = CryptoManager.computeSha256(cachedHmac)
-                    NfcHceBridge.updateEvent("NFC: Sent Signature Proof (32B). Provisioning Complete!")
-                    signatureProof + SW_SUCCESS
+                    /*
+                     * Kiệt calls RECE_SIGNATURE (P1 = 0x03). The phone is the signer in this flow; ESP32 is
+                     * the verifier. We return the cached IEEE P1363 signature R||S (64 bytes for P-256).
+                     *
+                     * If no challenge was received first, fail closed instead of signing a fake/default nonce.
+                     * This makes command-order bugs visible immediately during the PN532 test.
+                     */
+                    val signature = cachedSignature ?: return SW_CONDITIONS_NOT_SATISFIED
+                    NfcHceBridge.updateEvent(
+                        "NFC: Sent ECDSA Signature (${signature.size}B) to ESP32 for verification."
+                    )
+                    signature + SW_SUCCESS
                 }
                 else -> SW_INS_NOT_SUPPORTED
             }
@@ -160,6 +244,13 @@ class SmartKeyApduService : HostApduService() {
             DEACTIVATION_DESELECTED -> "Deselected"
             else -> "Reason $reason"
         }
+        // Session-only values must not leak into the next physical NFC tap. The Phone Identity key remains
+        // in AndroidKeyStore and is intentionally NOT deleted here.
+        cachedHmac = null
+        cachedChallengeNonce = null
+        cachedSignature = null
+        receivedEspKey = null
+
         NfcHceBridge.updateEvent("NFC HCE: Deactivated ($reasonStr)")
     }
 }

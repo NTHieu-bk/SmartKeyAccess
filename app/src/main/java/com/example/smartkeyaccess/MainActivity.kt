@@ -60,6 +60,7 @@ import com.example.smartkeyaccess.ui.theme.SmartKeyAccessTheme
 import com.example.smartkeyaccess.crypto.CryptoManager
 import com.example.smartkeyaccess.mock.MockDataProvider
 import com.example.smartkeyaccess.nfc.NfcHceBridge
+import com.example.smartkeyaccess.protocol.SmartKeyProtocol
 import kotlinx.coroutines.launch
 import java.util.Locale
 import java.util.UUID
@@ -77,7 +78,6 @@ enum class BleState {
     DISCOVERING,
     MTU_NEGOTIATING,
     SUBSCRIBING,
-    PIPE_TESTING,
     DATA_READY,
     ERROR
 }
@@ -103,6 +103,13 @@ class MainActivity : ComponentActivity() {
     private var status by mutableStateOf("Ready to find ESP32")
     private var rttTelemetryMs by mutableStateOf<Double?>(null)
     private var negotiatedMtu by mutableStateOf(23)
+    private var currentSessionId by mutableStateOf<Long?>(null)
+
+    // ESP32 TX Telemetry state (JSON parsing & arbitrary payload)
+    private var esp32JsonPayload by mutableStateOf<String?>(null)
+    private var phoneDelayReportedMs by mutableStateOf<Int?>(null)
+    private var esp32DelayReportedMs by mutableStateOf<Int?>(null)
+    private var rawTxPayload by mutableStateOf<String?>(null)
 
     // NFC Master Card Provisioning state
     private var nfcStatus by mutableStateOf("NFC Idle. Tap 'Enable NFC Reader' to scan Master Card...")
@@ -118,21 +125,27 @@ class MainActivity : ComponentActivity() {
     private var notifyCharacteristic: BluetoothGattCharacteristic? = null
 
     /**
-     * Test vectors for Milestone M1 BLE GATT baseline validation.
-     * Verifies bi-directional pipe throughput before introducing crypto (M4) and UWB ranging (M2/M3).
+     * Request tracking for BLE request/response transactions.
+     *
+     * Important note for this project:
+     * - The current ESP32 firmware is allowed to send JSON telemetry to the phone at any time through TX Notify.
+     * - We therefore do NOT make PING/PONG a mandatory gate before DATA_READY.
+     * - requestPending is only used when the phone actively sends a request and expects a correlated response
+     *   (for example AUTH_REQ -> AUTH_RESP).
+     *
+     * This separation is useful for us as students because it prevents a debug feature (PING/PONG) from
+     * blocking the real data path that Kiệt needs to test.
      */
-    private val PING = "PING".encodeToByteArray()
-    private val PONG = "PONG".encodeToByteArray()
-    private var pingStartNs: Long = 0L
-    private var pingPending = false
+    private var requestStartNs: Long = 0L
+    private var requestPending = false
 
     /**
-     * Guard against dropped packets or unresponsive peripheral during PING/PONG pipe test.
+     * Guard against dropped packets or unresponsive peripheral during transmission.
      */
-    private val pingTimeout = Runnable {
-        if (pingPending) {
-            pingPending = false
-            failGatt("PING timeout: No PONG received within 2000ms")
+    private val requestTimeout = Runnable {
+        if (requestPending) {
+            requestPending = false
+            failGatt("Request timeout: No response received within 3000ms")
         }
     }
 
@@ -245,13 +258,19 @@ class MainActivity : ComponentActivity() {
                         bleStatus = status,
                         rttMs = rttTelemetryMs,
                         negotiatedMtu = negotiatedMtu,
-                        isBleBusy = scanning || bleState == BleState.CONNECTING || bleState == BleState.DISCOVERING || bleState == BleState.MTU_NEGOTIATING || bleState == BleState.SUBSCRIBING || bleState == BleState.PIPE_TESTING,
+                        sessionId = currentSessionId,
+                        isBleBusy = scanning || bleState == BleState.CONNECTING || bleState == BleState.DISCOVERING || bleState == BleState.MTU_NEGOTIATING || bleState == BleState.SUBSCRIBING,
                         onFindBleClick = ::startFindingEsp32,
                         onResetBleClick = ::resetConnection,
+                        onSendAuthClick = ::sendAuthRequest,
                         nfcStatus = nfcStatus,
                         vehicleIdHex = vehicleId?.let(CryptoManager::toHex),
                         masterKeyHex = masterSecretKey?.let(CryptoManager::toHex),
                         onStartNfcClick = ::startNfcReader,
+                        esp32JsonPayload = esp32JsonPayload,
+                        phoneDelayMs = phoneDelayReportedMs,
+                        esp32DelayMs = esp32DelayReportedMs,
+                        rawTxPayload = rawTxPayload,
                         modifier = Modifier.padding(innerPadding)
                     )
                 }
@@ -336,13 +355,13 @@ class MainActivity : ComponentActivity() {
      * Prevents Android OS connection table exhaustion (BluetoothGatt handle leak).
      */
     private fun cleanupGatt() {
-        handler.removeCallbacks(pingTimeout)
+        handler.removeCallbacks(requestTimeout)
         val gatt = bluetoothGatt
         bluetoothGatt = null
 
         writeCharacteristic = null
         notifyCharacteristic = null
-        pingPending = false
+        requestPending = false
 
         try {
             gatt?.disconnect()
@@ -368,6 +387,11 @@ class MainActivity : ComponentActivity() {
         cleanupGatt()
         targetDevice = null
         rttTelemetryMs = null
+        currentSessionId = null
+        esp32JsonPayload = null
+        phoneDelayReportedMs = null
+        esp32DelayReportedMs = null
+        rawTxPayload = null
         negotiatedMtu = 23
         bleState = BleState.READY
         status = "Ready to find ESP32"
@@ -413,7 +437,9 @@ class MainActivity : ComponentActivity() {
         }
 
         if (!started) {
-            // Graceful fallback: Do not fail connection. Default ATT MTU (23 bytes) is sufficient for M1 PING/PONG.
+            // Graceful fallback: do not fail the BLE connection only because MTU negotiation did not start.
+            // Small telemetry JSON can still be received with the default ATT MTU. Larger crypto frames will
+            // need either a bigger negotiated MTU or fragmentation later when that milestone is implemented.
             runOnUiThread {
                 status = "MTU request not started, continuing with default 23 bytes..."
             }
@@ -465,27 +491,27 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun sendPing(gatt: BluetoothGatt) {
+    // =========================================================================
+    // TRANSPORT LAYER (Generic Frame Transmission)
+    // =========================================================================
+
+    /**
+     * Transport Layer: Transmits an arbitrary binary frame over the BLE GATT RX characteristic.
+     */
+    private fun writeBleFrame(frame: ByteArray, onFailed: (Int) -> Unit = {}): Boolean {
+        val gatt = bluetoothGatt ?: run {
+            failGatt("BluetoothGatt handle is null")
+            return false
+        }
         val writeChar = writeCharacteristic ?: run {
             failGatt("Write characteristic missing")
-            return
-        }
-
-        pingStartNs = SystemClock.elapsedRealtimeNanos()
-        pingPending = true
-
-        // Bound the pipe test so a missing PONG cannot leave the state machine stuck.
-        handler.removeCallbacks(pingTimeout)
-        handler.postDelayed(pingTimeout, 2_000L)
-
-        runOnUiThread {
-            status = "Testing data pipe: Sending PING (4B) to ESP32..."
+            return false
         }
 
         val result = try {
             gatt.writeCharacteristic(
                 writeChar,
-                PING,
+                frame,
                 BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
             )
         } catch (_: SecurityException) {
@@ -493,10 +519,207 @@ class MainActivity : ComponentActivity() {
         }
 
         if (result != BluetoothStatusCodes.SUCCESS) {
-            pingPending = false
-            handler.removeCallbacks(pingTimeout)
-            failGatt("writeCharacteristic PING failed (code $result)")
+            requestPending = false
+            handler.removeCallbacks(requestTimeout)
+            onFailed(result)
+            return false
         }
+        return true
+    }
+
+    // =========================================================================
+    // APPLICATION LAYER (Outbound Messages)
+    // =========================================================================
+
+    /**
+     * OPTIONAL diagnostic helper only.
+     *
+     * Earlier M1 code used ASCII "PING" -> "PONG" to prove that both BLE directions worked.
+     * Kiệt's current firmware flow does not require PING/PONG before normal traffic, so this function is
+     * intentionally NOT called automatically after CCCD subscription anymore.
+     *
+     * If the firmware later adds a PING handler, this helper can still be called manually while debugging.
+     * The measured value is application/GATT round-trip time, not UWB Time-of-Flight and must not be used
+     * to calculate distance.
+     */
+    private fun sendPing() {
+        requestStartNs = SystemClock.elapsedRealtimeNanos()
+        requestPending = true
+        handler.removeCallbacks(requestTimeout)
+        handler.postDelayed(requestTimeout, 3_000L)
+
+        runOnUiThread {
+            status = "Testing data pipe: Sending PING (4B) to ESP32..."
+        }
+
+        val frame = "PING".encodeToByteArray()
+        writeBleFrame(frame) { errCode ->
+            failGatt("writeCharacteristic PING failed (code $errCode)")
+        }
+    }
+
+    /**
+     * Application Layer: Performs cryptographic handshake using binary AUTH_REQ frame (60 bytes).
+     */
+    private fun sendAuthRequest() {
+        requestStartNs = SystemClock.elapsedRealtimeNanos()
+        requestPending = true
+        handler.removeCallbacks(requestTimeout)
+        handler.postDelayed(requestTimeout, 3_000L)
+
+        runOnUiThread {
+            status = "Authenticating: Sending binary AUTH_REQ (60B) to ESP32..."
+        }
+
+        val phoneNonce = ByteArray(SmartKeyProtocol.NONCE_SIZE).also { java.security.SecureRandom().nextBytes(it) }
+        val phoneId = "PHON0001".toByteArray(Charsets.UTF_8)
+        val payload = SmartKeyProtocol.buildAuthRequestPayload(phoneId, phoneNonce)
+        val authTag = ByteArray(SmartKeyProtocol.AUTH_TAG_SIZE) // Empty tag for initial handshake
+
+        val frame = SmartKeyProtocol.encodeFrame(
+            msgType = SmartKeyProtocol.MSG_AUTH_REQ,
+            payload = payload,
+            authTag = authTag
+        )
+
+        writeBleFrame(frame) { errCode ->
+            failGatt("writeCharacteristic AUTH_REQ failed (code $errCode)")
+        }
+    }
+
+    // =========================================================================
+    // PROTOCOL LAYER (Incoming Message Demuxing & Dispatch)
+    // =========================================================================
+
+    /**
+     * Common receive entry point for every notification coming from ESP32 TX characteristic.
+     *
+     * We do not call readCharacteristic() here. TX is configured as NOTIFY, therefore ESP32 pushes a value
+     * and Android delivers that value to onCharacteristicChanged(), which then forwards it here.
+     *
+     * For the current integration test requested by Kiệt, the most important branch is JSON telemetry:
+     *     {"phone":200,"esp32":100}
+     * The app keeps the complete JSON for display and also extracts the two delay values when present.
+     * Other branches are kept because the same TX pipe will later carry AUTH_RESP and protocol frames.
+     */
+    private fun handleBleMessage(value: ByteArray) {
+        val textValue = try {
+            String(value, Charsets.UTF_8).trim()
+        } catch (_: Exception) {
+            null
+        }
+
+        // 1. ASCII or binary PONG pipe test response
+        if (value.contentEquals("PONG".encodeToByteArray()) || textValue == "PONG") {
+            val endNs = SystemClock.elapsedRealtimeNanos()
+            val rtt = (endNs - requestStartNs) / 1_000_000.0
+            requestPending = false
+            handler.removeCallbacks(requestTimeout)
+            runOnUiThread {
+                handlePongResponse(rtt)
+            }
+            return
+        }
+
+        // 2. JSON Telemetry payload from ESP32 TX Notify (e.g. {"phone":200,"esp32":100})
+        if (textValue != null && textValue.startsWith("{") && textValue.endsWith("}")) {
+            try {
+                val json = org.json.JSONObject(textValue)
+
+                // Kiệt's current test packet uses the short keys "phone" and "esp32".
+                // A few aliases are accepted as a small convenience while the JSON contract is still being finalized.
+                fun readDelay(vararg keys: String): Int? {
+                    for (key in keys) {
+                        if (json.has(key) && !json.isNull(key)) {
+                            val value = json.optInt(key, Int.MIN_VALUE)
+                            if (value != Int.MIN_VALUE) return value
+                        }
+                    }
+                    return null
+                }
+
+                val phoneDelay = readDelay("phone", "phoneDelay", "phone_delay")
+                val esp32Delay = readDelay("esp32", "esp32Delay", "esp32_delay")
+
+                runOnUiThread {
+                    esp32JsonPayload = textValue
+                    phoneDelayReportedMs = phoneDelay
+                    esp32DelayReportedMs = esp32Delay
+                    status = buildString {
+                        append("JSON received from ESP32!")
+                        if (phoneDelay != null) append(" Phone delay: ${phoneDelay}ms")
+                        if (esp32Delay != null) append(" | ESP32 delay: ${esp32Delay}ms")
+                    }
+                }
+                return
+            } catch (_: Exception) {
+                // Not valid JSON, continue to raw text
+            }
+        }
+
+        // 3. Binary SmartKeyProtocol frame (0xA5 header)
+        val header = SmartKeyProtocol.parseHeader(value)
+        if (header != null) {
+            val endNs = SystemClock.elapsedRealtimeNanos()
+            val rtt = (endNs - requestStartNs) / 1_000_000.0
+            requestPending = false
+            handler.removeCallbacks(requestTimeout)
+
+            runOnUiThread {
+                when (header.msgType) {
+                    SmartKeyProtocol.MSG_PONG -> {
+                        handlePongResponse(rtt)
+                    }
+                    SmartKeyProtocol.MSG_AUTH_RESP -> {
+                        val payloadBytes = if (value.size > SmartKeyProtocol.HEADER_SIZE) {
+                            value.copyOfRange(SmartKeyProtocol.HEADER_SIZE, value.size)
+                        } else ByteArray(0)
+                        handleAuthResponse(header, payloadBytes, rtt)
+                    }
+                    SmartKeyProtocol.MSG_UWB_CONFIG_RESP -> {
+                        bleState = BleState.DATA_READY
+                        status = "UWB_CONFIG_RESP received! Anchor Ready (RTT = %.2f ms)".format(Locale.US, rtt)
+                    }
+                    SmartKeyProtocol.MSG_ERROR_IND -> {
+                        val errCode = if (value.size > SmartKeyProtocol.HEADER_SIZE) value[SmartKeyProtocol.HEADER_SIZE] else SmartKeyProtocol.ERR_INTERNAL_FAULT
+                        bleState = BleState.ERROR
+                        status = "ESP32 Error: " + SmartKeyProtocol.getErrorMessage(errCode)
+                    }
+                    else -> {
+                        status = "Received unknown binary msg_type: 0x%02X".format(header.msgType)
+                    }
+                }
+            }
+            return
+        }
+
+        // 4. Fallback: arbitrary text or raw byte payload
+        if (textValue != null && textValue.isNotEmpty() && textValue.all { it.code in 32..126 || it == '\n' || it == '\r' }) {
+            runOnUiThread {
+                rawTxPayload = textValue
+                status = "Received TX text: $textValue"
+            }
+        } else {
+            runOnUiThread {
+                rawTxPayload = CryptoManager.toHex(value)
+                status = "Received raw TX bytes (${value.size}B): ${CryptoManager.toHex(value)}"
+            }
+        }
+    }
+
+    private fun handlePongResponse(rtt: Double) {
+        bleState = BleState.DATA_READY
+        rttTelemetryMs = rtt
+        status = "PONG received! BLE GATT RTT = ${String.format(Locale.US, "%.2f", rtt)} ms"
+    }
+
+    private fun handleAuthResponse(header: SmartKeyProtocol.Header, payloadBytes: ByteArray, rtt: Double) {
+        val authResp = SmartKeyProtocol.parseAuthResponsePayload(payloadBytes)
+        val sessionId = authResp?.newSessionId ?: header.sessionId
+        currentSessionId = sessionId
+        bleState = BleState.DATA_READY
+        rttTelemetryMs = rtt
+        status = "AUTH_RESP received! Session = $sessionId (Handshake RTT = ${String.format(Locale.US, "%.2f", rtt)} ms)"
     }
 
     private val gattCallback = object : BluetoothGattCallback() {
@@ -580,8 +803,10 @@ class MainActivity : ComponentActivity() {
                 negotiatedMtu = actualMtu
                 this@MainActivity.status = "MTU negotiated: $actualMtu bytes. Subscribing to notifications..."
             }
-            // Do NOT fail GATT if MTU is small. Baseline M1 only needs 4 bytes for PING/PONG.
-            // Higher layer (M4 Crypto) will inspect negotiatedMtu to decide direct vs fragmented transmission.
+            // Do not fail GATT only because the negotiated MTU is small.
+            // The current milestone mainly needs TX Notify to receive Kiệt's JSON telemetry.
+            // When public keys / encrypted frames are added, the higher protocol layer must check negotiatedMtu
+            // and choose direct transmission or fragmentation instead of assuming every frame fits in one ATT packet.
             subscribeToNotifications(gatt)
         }
 
@@ -595,11 +820,20 @@ class MainActivity : ComponentActivity() {
                 status == BluetoothGatt.GATT_SUCCESS
             ) {
                 runOnUiThread {
-                    // Semantics: At this point, notifications are enabled, but data path is not yet verified.
-                    bleState = BleState.PIPE_TESTING
-                    this@MainActivity.status = "Notifications enabled. Testing bidirectional data pipe (PING -> PONG)..."
+                    /*
+                     * Option B used for the current integration stage:
+                     * once CCCD 0x2902 has been written successfully, the phone is ready to RECEIVE TX Notify.
+                     * We do not force an automatic PING/PONG test here because Kiệt's current firmware may not
+                     * implement the old text PING handler. Forcing PING would cause a timeout and disconnect even
+                     * though the TX notification path itself is perfectly usable for the JSON test.
+                     *
+                     * DATA_READY here means "GATT data path configured and ready for application traffic",
+                     * not "authentication finished" and not "UWB ready". Those are later protocol states.
+                     */
+                    bleState = BleState.DATA_READY
+                    this@MainActivity.status =
+                        "Notifications enabled. Ready to receive ESP32 TX data / JSON telemetry."
                 }
-                sendPing(gatt)
             } else {
                 failGatt("CCCD write failed with status $status")
             }
@@ -611,9 +845,9 @@ class MainActivity : ComponentActivity() {
             status: Int
         ) {
             if (status != BluetoothGatt.GATT_SUCCESS) {
-                pingPending = false
-                handler.removeCallbacks(pingTimeout)
-                failGatt("PING write failed with status $status")
+                requestPending = false
+                handler.removeCallbacks(requestTimeout)
+                failGatt("writeCharacteristic failed with status $status")
             }
         }
 
@@ -622,25 +856,16 @@ class MainActivity : ComponentActivity() {
             characteristic: BluetoothGattCharacteristic,
             value: ByteArray
         ) {
-            if (!pingPending) return
-
+            // TX is the ESP32 -> Phone direction. Android invokes this callback whenever Kiệt calls notify()
+            // on the TX characteristic. We only accept the UUID that was discovered and saved earlier so that
+            // a notification from another characteristic cannot accidentally enter the Smart Key parser.
             if (characteristic.uuid != notifyCharacteristic?.uuid) {
                 return
             }
 
-            if (value.contentEquals(PONG)) {
-                val endNs = SystemClock.elapsedRealtimeNanos()
-                val rtt = (endNs - pingStartNs) / 1_000_000.0
-                pingPending = false
-                handler.removeCallbacks(pingTimeout)
-
-                runOnUiThread {
-                    // Only transition to DATA_READY once PONG is verified over the air
-                    bleState = BleState.DATA_READY
-                    rttTelemetryMs = rtt
-                    this@MainActivity.status = "PONG received! BLE GATT RTT = ${String.format(Locale.US, "%.2f", rtt)} ms"
-                }
-            }
+            // Keep the Bluetooth callback small. The common handler decides whether the value is JSON, PONG,
+            // a binary SmartKey frame, or just raw text/bytes for debugging.
+            handleBleMessage(value)
         }
     }
 
@@ -657,13 +882,19 @@ private fun SmartKeyMainScreen(
     bleStatus: String,
     rttMs: Double?,
     negotiatedMtu: Int,
+    sessionId: Long?,
     isBleBusy: Boolean,
     onFindBleClick: () -> Unit,
     onResetBleClick: () -> Unit,
+    onSendAuthClick: () -> Unit,
     nfcStatus: String,
     vehicleIdHex: String?,
     masterKeyHex: String?,
     onStartNfcClick: () -> Unit,
+    esp32JsonPayload: String? = null,
+    phoneDelayMs: Int? = null,
+    esp32DelayMs: Int? = null,
+    rawTxPayload: String? = null,
     modifier: Modifier = Modifier
 ) {
     val scrollState = rememberScrollState()
@@ -723,7 +954,7 @@ private fun SmartKeyMainScreen(
             }
         }
 
-        // CARD 2: BLE Central GATT Pipeline (M1 Baseline)
+        // CARD 2: BLE Central GATT Pipeline (Layered Architecture)
         Card(
             modifier = Modifier.fillMaxWidth(),
             colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
@@ -733,7 +964,7 @@ private fun SmartKeyMainScreen(
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 Text(
-                    text = "2. BLE Central Pipeline (M1 Baseline)",
+                    text = "2. BLE Central Pipeline (Layered Protocol)",
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.Bold,
                     color = MaterialTheme.colorScheme.primary
@@ -752,6 +983,15 @@ private fun SmartKeyMainScreen(
                     style = MaterialTheme.typography.bodySmall,
                     fontFamily = FontFamily.Monospace
                 )
+                if (sessionId != null) {
+                    Text(
+                        text = "Session ID: $sessionId",
+                        style = MaterialTheme.typography.bodySmall,
+                        fontFamily = FontFamily.Monospace,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.tertiary
+                    )
+                }
                 Text(
                     text = "Status: $bleStatus",
                     style = MaterialTheme.typography.bodyMedium
@@ -759,7 +999,7 @@ private fun SmartKeyMainScreen(
 
                 if (rttMs != null) {
                     Text(
-                        text = "BLE GATT Round-Trip (RTT): ${String.format(Locale.US, "%.2f", rttMs)} ms",
+                        text = "Round-Trip Latency (RTT): ${String.format(Locale.US, "%.2f", rttMs)} ms",
                         fontWeight = FontWeight.Bold,
                         color = MaterialTheme.colorScheme.primary
                     )
@@ -786,6 +1026,78 @@ private fun SmartKeyMainScreen(
                         }
                     }
                 }
+
+                if (bleState == BleState.DATA_READY) {
+                    Text(
+                        text = "TX Notify is active. Waiting for ESP32 JSON telemetry; PING/PONG is not mandatory in Option B.",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+
+                    Button(
+                        onClick = onSendAuthClick,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("Auth Handshake (later protocol test)")
+                    }
+                }
+            }
+        }
+
+        // CARD 3: ESP32 TX Telemetry (JSON / Payload Viewer)
+        if (esp32JsonPayload != null || phoneDelayMs != null || esp32DelayMs != null || rawTxPayload != null) {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer)
+            ) {
+                Column(
+                    modifier = Modifier.padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Text(
+                        text = "3. ESP32 TX Telemetry",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onSecondaryContainer
+                    )
+
+                    if (esp32JsonPayload != null) {
+                        Text(
+                            text = "JSON: $esp32JsonPayload",
+                            style = MaterialTheme.typography.bodySmall,
+                            fontFamily = FontFamily.Monospace
+                        )
+                    }
+
+                    if (phoneDelayMs != null || esp32DelayMs != null) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            if (phoneDelayMs != null) {
+                                Text(
+                                    text = "Phone delay: ${phoneDelayMs} ms",
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = MaterialTheme.colorScheme.primary
+                                )
+                            }
+                            if (esp32DelayMs != null) {
+                                Text(
+                                    text = "ESP32 delay: ${esp32DelayMs} ms",
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = MaterialTheme.colorScheme.secondary
+                                )
+                            }
+                        }
+                    }
+
+                    if (rawTxPayload != null) {
+                        Text(
+                            text = "Raw TX: $rawTxPayload",
+                            style = MaterialTheme.typography.bodySmall,
+                            fontFamily = FontFamily.Monospace
+                        )
+                    }
+                }
             }
         }
     }
@@ -797,16 +1109,23 @@ private fun SmartKeyMainScreenPreview() {
     SmartKeyAccessTheme {
         SmartKeyMainScreen(
             bleState = BleState.DATA_READY,
-            bleStatus = "PONG received! BLE GATT RTT = 24.50 ms",
-            rttMs = 24.5,
+            bleStatus = "Notifications enabled. Ready to receive ESP32 TX data / JSON telemetry.",
+            rttMs = null,
             negotiatedMtu = 512,
+            sessionId = 412589L,
             isBleBusy = false,
             onFindBleClick = {},
             onResetBleClick = {},
+            onSendAuthClick = {},
             nfcStatus = "NFC active. Tap Master Card to device...",
             vehicleIdHex = "0102030405060708",
             masterKeyHex = "0102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F20",
-            onStartNfcClick = {}
+            onStartNfcClick = {},
+            esp32JsonPayload = "{\"phone\":200,\"esp32\":100}",
+            phoneDelayMs = 200,
+            esp32DelayMs = 100,
+            rawTxPayload = null
         )
     }
 }
+
