@@ -27,18 +27,18 @@ object CryptoManager {
     private const val HASH_ALGORITHM = "SHA-256"
     private const val ECDH_ALGORITHM = "ECDH"
 
-    // Key identity cố định của điện thoại (lưu trong AndroidKeyStore để không bị đổi mỗi lần mở lại app)
+    // Persistent phone identity key alias stored securely in AndroidKeyStore
     private const val PHONE_IDENTITY_KEY_ALIAS = "smartkey_phone_identity_p256"
 
     val DEFAULT_HKDF_INFO: ByteArray = "SmartKey-UWB-AES128-v1".toByteArray(Charsets.UTF_8)
 
-    // Băm SHA-256
+    // Compute SHA-256 digest
     fun computeSha256(data: ByteArray): ByteArray {
         val digest = MessageDigest.getInstance(HASH_ALGORITHM)
         return digest.digest(data)
     }
 
-    // HMAC-SHA256 dùng MSK để xác thực nonce/VID
+    // Compute HMAC-SHA256 with MSK
     fun computeHmacSha256(key: ByteArray, data: ByteArray): ByteArray {
         val mac = Mac.getInstance(HMAC_ALGORITHM)
         val keySpec = SecretKeySpec(key, HMAC_ALGORITHM)
@@ -46,7 +46,7 @@ object CryptoManager {
         return mac.doFinal(data)
     }
 
-    // Cặp key ECDH tạm thời cho từng phiên BLE
+    // Ephemeral ECDH key pair for BLE session
     fun generateEcdhKeyPair(): KeyPair {
         val kpg = KeyPairGenerator.getInstance("EC")
         val ecSpec = ECGenParameterSpec(EC_CURVE_NAME)
@@ -54,7 +54,7 @@ object CryptoManager {
         return kpg.generateKeyPair()
     }
 
-    // Chuẩn ECPoint 66 bytes theo mbedTLS trên ESP32: 0x41 0x04 || 32B X || 32B Y
+    // 66-byte TLS ECPoint format matching ESP32 mbedTLS: 0x41 0x04 || 32B X || 32B Y
     fun encodeTlsEcPoint(publicKey: ECPublicKey): ByteArray {
         val xBytes = toUnsigned32Bytes(publicKey.w.affineX)
         val yBytes = toUnsigned32Bytes(publicKey.w.affineY)
@@ -67,13 +67,13 @@ object CryptoManager {
         return result
     }
 
-    // Giải mã public key 66B (TLS) hoặc 65B (ANSI X9.62)
+    // Decode 66-byte TLS or 65-byte uncompressed EC public key
     fun decodeTlsEcPoint(bytes: ByteArray): ECPublicKey {
         val offset = when {
             bytes.size == 66 && bytes[0] == 0x41.toByte() && bytes[1] == 0x04.toByte() -> 2
             bytes.size == 65 && bytes[0] == 0x04.toByte() -> 1
             else -> throw IllegalArgumentException(
-                "Độ dài public key không hợp lệ: ${bytes.size}B (cần 66B hoặc 65B)"
+                "Invalid public key length: ${bytes.size}B (expected 66B or 65B)"
             )
         }
 
@@ -90,7 +90,7 @@ object CryptoManager {
         return keyFactory.generatePublic(keySpec) as ECPublicKey
     }
 
-    // Tính shared secret ECDH
+    // Compute ECDH shared secret
     fun computeSharedSecret(privateKey: ECPrivateKey, peerPublicKey: ECPublicKey): ByteArray {
         val keyAgreement = KeyAgreement.getInstance(ECDH_ALGORITHM)
         keyAgreement.init(privateKey)
@@ -98,13 +98,13 @@ object CryptoManager {
         return keyAgreement.generateSecret()
     }
 
-    // Dùng HKDF trích xuất key phiên (mặc định lấy 16B cho AES-128)
+    // Derive symmetric session key via HKDF-SHA256 (default 16 bytes for AES-128)
     fun deriveSessionKey(
         sharedSecret: ByteArray,
         info: ByteArray = DEFAULT_HKDF_INFO,
         keyLength: Int = 16
     ): ByteArray {
-        require(keyLength in 1..32) { "Key length phải từ 1 đến 32 bytes" }
+        require(keyLength in 1..32) { "Key length must be between 1 and 32 bytes" }
 
         val zeroSalt = ByteArray(32)
         val prk = computeHmacSha256(zeroSalt, sharedSecret)
@@ -123,7 +123,7 @@ object CryptoManager {
 
     fun fromHex(hex: String): ByteArray {
         val cleanHex = hex.replace(" ", "")
-        require(cleanHex.length % 2 == 0) { "Chuỗi hex phải có số ký tự chẵn" }
+        require(cleanHex.length % 2 == 0) { "Hex string must have an even length" }
 
         val result = ByteArray(cleanHex.length / 2)
         for (i in result.indices) {
@@ -150,7 +150,7 @@ object CryptoManager {
         return params.getParameterSpec(ECParameterSpec::class.java)
     }
 
-    // Lấy cặp key định danh cố định trong AndroidKeyStore (tạo mới nếu chưa có, fallback cho test)
+    // Retrieve or create persistent identity key pair in AndroidKeyStore
     fun getOrCreateIdentityKeyPair(): KeyPair {
         return try {
             val keyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
@@ -174,20 +174,20 @@ object CryptoManager {
             }
 
             val privateKey = (keyStore.getKey(PHONE_IDENTITY_KEY_ALIAS, null) as? java.security.PrivateKey)
-                ?: error("Không tìm thấy private key trong AndroidKeyStore")
+                ?: error("Private key not found in AndroidKeyStore")
             val publicKey = keyStore.getCertificate(PHONE_IDENTITY_KEY_ALIAS)?.publicKey
-                ?: error("Không tìm thấy public key trong AndroidKeyStore")
+                ?: error("Public key not found in AndroidKeyStore")
 
             KeyPair(publicKey, privateKey)
         } catch (_: Exception) {
-            // Khi chạy unit test trên máy tính không có AndroidKeyStore, fallback sinh cặp key EC tiêu chuẩn
+            // Fallback for JVM host unit tests where AndroidKeyStore is unavailable
             generateEcdhKeyPair()
         }
     }
 
     fun generateIdentityKeyPair(): KeyPair = getOrCreateIdentityKeyPair()
 
-    // Ký số ECDSA chuẩn IEEE P1363 (đúng 64 bytes: 32B R || 32B S, khớp mbedTLS trên ESP32)
+    // Sign using ECDSA in IEEE P1363 format (exactly 64 bytes: 32B R || 32B S)
     fun signEcdsaP1363(privateKey: java.security.PrivateKey, data: ByteArray): ByteArray {
         return try {
             val sig = java.security.Signature.getInstance("SHA256withECDSAinP1363Format")
@@ -202,7 +202,7 @@ object CryptoManager {
         }
     }
 
-    // Xác minh chữ ký P1363 (dùng trong test hoặc kiểm tra chéo)
+    // Verify ECDSA signature in IEEE P1363 format
     fun verifyEcdsaP1363(publicKey: ECPublicKey, data: ByteArray, signatureP1363: ByteArray): Boolean {
         if (signatureP1363.size != 64) return false
         return try {
@@ -222,7 +222,7 @@ object CryptoManager {
         }
     }
 
-    // Chuyển DER sang P1363 (cắt bỏ header ASN.1 và lấy đúng 32B R + 32B S)
+    // Convert DER signature to IEEE P1363 (32B R || 32B S)
     fun derToP1363(der: ByteArray): ByteArray {
         var offset = 2
         if (der.size > 1 && (der[1].toInt() and 0x80) != 0) {
@@ -230,12 +230,12 @@ object CryptoManager {
             offset = 2 + lenBytes
         }
 
-        require(der.size > offset + 2 && der[offset] == 0x02.toByte()) { "Tag INTEGER của R không đúng" }
+        require(der.size > offset + 2 && der[offset] == 0x02.toByte()) { "Invalid R integer tag" }
         val rLen = der[offset + 1].toInt() and 0xFF
         val rBytes = der.copyOfRange(offset + 2, offset + 2 + rLen)
         offset += 2 + rLen
 
-        require(der.size > offset + 2 && der[offset] == 0x02.toByte()) { "Tag INTEGER của S không đúng" }
+        require(der.size > offset + 2 && der[offset] == 0x02.toByte()) { "Invalid S integer tag" }
         val sLen = der[offset + 1].toInt() and 0xFF
         val sBytes = der.copyOfRange(offset + 2, offset + 2 + sLen)
 
@@ -248,9 +248,9 @@ object CryptoManager {
         return result
     }
 
-    // Chuyển P1363 64B về DER (dùng khi fallback thư viện cũ)
+    // Convert IEEE P1363 signature back to ASN.1 DER format
     fun p1363ToDer(p1363: ByteArray): ByteArray {
-        require(p1363.size == 64) { "Độ dài P1363 phải đúng 64 bytes" }
+        require(p1363.size == 64) { "P1363 signature length must be exactly 64 bytes" }
         val r = BigInteger(1, p1363.copyOfRange(0, 32))
         val s = BigInteger(1, p1363.copyOfRange(32, 64))
 

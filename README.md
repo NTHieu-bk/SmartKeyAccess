@@ -873,25 +873,7 @@ Các giá trị này chỉ là **test vectors**, không phải secret thực t�
 
 ---
 
-# 13. Những điểm cần chốt với Firmware
-
-Các mục này nên được xác nhận trước khi tiếp tục secure session:
-
-1. **Phone Identity Public Key wire format** cuối cùng là 32B compatibility, 65B uncompressed hay 66B TLS ECPoint.
-2. **ESP32 ECDSA verifier** nhận P1363 `R||S` 64B hay format khác.
-3. **BLE JSON contract** cuối cùng dùng key nào:
-   ```text
-   phone / esp32
-   ```
-   hay tên field dài hơn.
-4. PING/PONG có được giữ làm debug command hay bỏ khỏi firmware production.
-5. Binary `SmartKeyProtocol` frame nào sẽ được sử dụng trong milestone secure session.
-6. ECDH/HKDF sẽ derive những key nào (`K_BLE`, `K_UWB`, `K_MAC`, ...).
-7. AES-GCM payload format, nonce/IV, tag size và fragmentation rule.
-
----
-
-# 14. Build
+# 13. Build
 
 Windows PowerShell:
 
@@ -908,7 +890,7 @@ app/build/outputs/apk/debug/app-debug.apk
 
 ---
 
-# 15. Các bước tiếp theo
+# 14. Các bước tiếp theo
 
 Ưu tiên ngắn hạn:
 
@@ -936,7 +918,7 @@ Sau khi baseline trên ổn định:
 
 ---
 
-# 16. Ghi chú phát triển
+# 15. Ghi chú phát triển
 
 - Không hardcode secret production trong source code.
 - `MockDataProvider` chỉ dùng cho test/integration.

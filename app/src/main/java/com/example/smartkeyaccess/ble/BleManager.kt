@@ -58,7 +58,7 @@ class BleManager(
     private val _bleState = MutableStateFlow(BleState.READY)
     val bleState: StateFlow<BleState> = _bleState.asStateFlow()
 
-    private val _status = MutableStateFlow("Sẵn sàng tìm ESP32")
+    private val _status = MutableStateFlow("Ready to find ESP32")
     val status: StateFlow<String> = _status.asStateFlow()
 
     private val _rttMs = MutableStateFlow<Double?>(null)
@@ -95,13 +95,13 @@ class BleManager(
     private var requestStartNs = 0L
     private var requestPending = false
 
-    // Danh sách chờ ghi descriptor để không bị ghi chồng lệnh GATT
+    // Queue for descriptor writes to avoid GATT command collisions
     private val descriptorWriteQueue = ArrayDeque<BluetoothGattDescriptor>()
 
     private val requestTimeout = Runnable {
         if (requestPending) {
             requestPending = false
-            failGatt("Hết thời gian chờ phản hồi (3000ms)")
+            failGatt("Response timeout (3000ms)")
         }
     }
 
@@ -109,7 +109,7 @@ class BleManager(
         if (scanning) {
             stopScan()
             _bleState.value = BleState.ERROR
-            _status.value = "Hết 10s không tìm thấy ESP32 quảng bá"
+            _status.value = "Scan timeout: ESP32 not found within 10s"
         }
     }
 
@@ -120,7 +120,7 @@ class BleManager(
                 val device = result.device
                 stopScan()
                 _bleState.value = BleState.FOUND
-                _status.value = "Tìm thấy ESP32 (${device.address}), đang kết nối GATT..."
+                _status.value = "Found ESP32 (${device.address}), connecting GATT..."
                 connectGatt(device)
             }
         }
@@ -128,7 +128,7 @@ class BleManager(
         override fun onScanFailed(errorCode: Int) {
             stopScan()
             _bleState.value = BleState.ERROR
-            _status.value = "Quét BLE thất bại (Mã lỗi: $errorCode)"
+            _status.value = "BLE scan failed with error code $errorCode"
         }
     }
 
@@ -140,14 +140,14 @@ class BleManager(
         val leScanner = adapter.bluetoothLeScanner
         if (leScanner == null) {
             _bleState.value = BleState.ERROR
-            _status.value = "Không khởi tạo được BLE Scanner"
+            _status.value = "Unable to initialize BLE Scanner"
             return false
         }
 
         scanner = leScanner
         scanning = true
         _bleState.value = BleState.SCANNING
-        _status.value = "Đang quét tìm ESP32..."
+        _status.value = "Scanning for ESP32..."
         leScanner.startScan(scanCallback)
         handler.postDelayed(scanTimeout, 10_000L)
         return true
@@ -166,10 +166,9 @@ class BleManager(
     private fun connectGatt(device: BluetoothDevice) {
         _bleState.value = BleState.CONNECTING
         try {
-            // autoConnect = false để kết nối radio ngay lập tức
             bluetoothGatt = device.connectGatt(context, false, gattCallback)
         } catch (e: Exception) {
-            failGatt("Lỗi connectGatt: ${e.message}")
+            failGatt("connectGatt failed: ${e.message}")
         }
     }
 
@@ -190,7 +189,7 @@ class BleManager(
     private fun failGatt(reason: String) {
         cleanupGatt()
         _bleState.value = BleState.ERROR
-        _status.value = "GATT Lỗi: $reason"
+        _status.value = "GATT error: $reason"
     }
 
     fun reset() {
@@ -205,17 +204,17 @@ class BleManager(
         _nonceEvent.value = null
         _negotiatedMtu.value = 23
         _bleState.value = BleState.READY
-        _status.value = "Sẵn sàng tìm ESP32"
+        _status.value = "Ready to find ESP32"
     }
 
-    // Gửi frame nhị phân hoặc chuỗi byte qua RX (Write)
+    // Write binary frame or raw bytes over RX characteristic
     fun writeBleFrame(frame: ByteArray, onFailed: (Int) -> Unit = {}): Boolean {
         val gatt = bluetoothGatt ?: run {
-            failGatt("Chưa kết nối GATT")
+            failGatt("GATT not connected")
             return false
         }
         val targetChar = writeChar ?: run {
-            failGatt("Không tìm thấy characteristic RX")
+            failGatt("RX characteristic not found")
             return false
         }
 
@@ -238,7 +237,7 @@ class BleManager(
         return true
     }
 
-    // Ghi response trực tiếp vào Nonce Characteristic (6E400004)
+    // Write response back to Nonce characteristic (6E400004)
     fun writeNonceResponse(response: ByteArray): Boolean {
         val gatt = bluetoothGatt ?: return false
         val targetChar = nonceChar ?: return false
@@ -255,27 +254,27 @@ class BleManager(
         return res == BluetoothStatusCodes.SUCCESS
     }
 
-    // Gửi PING để đo RTT nếu cần
+    // Send PING to measure OTA round-trip latency
     fun sendPing() {
         requestStartNs = SystemClock.elapsedRealtimeNanos()
         requestPending = true
         handler.removeCallbacks(requestTimeout)
         handler.postDelayed(requestTimeout, 3_000L)
-        _status.value = "Đang gửi PING (4B) tới ESP32..."
+        _status.value = "Sending PING (4B) to ESP32..."
 
         val frame = "PING".encodeToByteArray()
         writeBleFrame(frame) { errCode ->
-            failGatt("Ghi PING thất bại (mã $errCode)")
+            failGatt("PING write failed (code $errCode)")
         }
     }
 
-    // Gửi gói AUTH_REQ nhị phân chuẩn bị cho bước bắt tay
+    // Send binary AUTH_REQ frame
     fun sendAuthRequest() {
         requestStartNs = SystemClock.elapsedRealtimeNanos()
         requestPending = true
         handler.removeCallbacks(requestTimeout)
         handler.postDelayed(requestTimeout, 3_000L)
-        _status.value = "Đang gửi AUTH_REQ nhị phân (60B)..."
+        _status.value = "Sending binary AUTH_REQ (60B)..."
 
         val phoneNonce = ByteArray(SmartKeyProtocol.NONCE_SIZE).also { SecureRandom().nextBytes(it) }
         val phoneId = "PHON0001".toByteArray(Charsets.UTF_8)
@@ -289,7 +288,7 @@ class BleManager(
         )
 
         writeBleFrame(frame) { errCode ->
-            failGatt("Ghi AUTH_REQ thất bại (mã $errCode)")
+            failGatt("AUTH_REQ write failed (code $errCode)")
         }
     }
 
@@ -300,24 +299,24 @@ class BleManager(
                 val ok = try { gatt.discoverServices() } catch (_: Exception) { false }
                 if (ok) {
                     _bleState.value = BleState.DISCOVERING
-                    _status.value = "Đã kết nối! Đang tìm GATT Services..."
+                    _status.value = "Connected! Discovering GATT services..."
                 } else {
-                    failGatt("Không thể gọi discoverServices()")
+                    failGatt("discoverServices() invocation failed")
                 }
             } else {
-                failGatt("Ngắt kết nối hoặc lỗi status=$status")
+                failGatt("Disconnected or error status=$status")
             }
         }
 
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
             if (status != BluetoothGatt.GATT_SUCCESS) {
-                failGatt("Tìm service thất bại (status $status)")
+                failGatt("Service discovery failed (status $status)")
                 return
             }
 
             val service = gatt.getService(SERVICE_UUID)
             if (service == null) {
-                failGatt("Không tìm thấy Service Smart Key ($SERVICE_UUID)")
+                failGatt("Smart Key Service not found ($SERVICE_UUID)")
                 return
             }
 
@@ -326,13 +325,12 @@ class BleManager(
             nonceChar = service.getCharacteristic(NONCE_UUID)
 
             if (writeChar == null || notifyChar == null) {
-                failGatt("Thiếu characteristic RX hoặc TX trong service")
+                failGatt("Missing required RX or TX characteristic")
                 return
             }
 
-            // Xin MTU 512B
             _bleState.value = BleState.MTU_NEGOTIATING
-            _status.value = "Đang thương lượng MTU (512 bytes)..."
+            _status.value = "Negotiating MTU (512 bytes)..."
             val started = try { gatt.requestMtu(512) } catch (_: Exception) { false }
             if (!started) {
                 startSubscribing(gatt)
@@ -342,16 +340,16 @@ class BleManager(
         override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
             val actual = if (status == BluetoothGatt.GATT_SUCCESS) mtu else 23
             _negotiatedMtu.value = actual
-            _status.value = "MTU đạt $actual bytes. Đang đăng ký nhận Notify..."
+            _status.value = "MTU negotiated to $actual bytes. Subscribing to notifications..."
             startSubscribing(gatt)
         }
 
-        // Bật Notify tuần tự cho TX và Nonce characteristic
+        // Subscribe sequentially to TX and Nonce notifications
         private fun startSubscribing(gatt: BluetoothGatt) {
             _bleState.value = BleState.SUBSCRIBING
             descriptorWriteQueue.clear()
 
-            // 1. Subscribe TX (6E400003)
+            // Subscribe TX characteristic (6E400003)
             notifyChar?.let { char ->
                 try {
                     gatt.setCharacteristicNotification(char, true)
@@ -361,7 +359,7 @@ class BleManager(
                 } catch (_: Exception) {}
             }
 
-            // 2. Subscribe Nonce (6E400004) nếu firmware có cung cấp
+            // Subscribe Nonce characteristic (6E400004) if present
             nonceChar?.let { char ->
                 try {
                     gatt.setCharacteristicNotification(char, true)
@@ -376,9 +374,8 @@ class BleManager(
 
         private fun writeNextDescriptor(gatt: BluetoothGatt) {
             if (descriptorWriteQueue.isEmpty()) {
-                // Đã bật xong toàn bộ notification cần thiết
                 _bleState.value = BleState.DATA_READY
-                _status.value = "Đã bật Notify (TX + Nonce). Sẵn sàng nhận dữ liệu từ ESP32."
+                _status.value = "Notifications enabled (TX + Nonce). Ready for data exchange."
                 return
             }
 
@@ -386,7 +383,7 @@ class BleManager(
             try {
                 gatt.writeDescriptor(desc, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
             } catch (e: Exception) {
-                failGatt("Ghi CCCD lỗi: ${e.message}")
+                failGatt("writeDescriptor failed: ${e.message}")
             }
         }
 
@@ -394,7 +391,7 @@ class BleManager(
             if (status == BluetoothGatt.GATT_SUCCESS) {
                 writeNextDescriptor(gatt)
             } else {
-                failGatt("Ghi CCCD thất bại (status $status)")
+                failGatt("CCCD write failed (status $status)")
             }
         }
 
@@ -402,7 +399,7 @@ class BleManager(
             if (status != BluetoothGatt.GATT_SUCCESS) {
                 requestPending = false
                 handler.removeCallbacks(requestTimeout)
-                failGatt("Ghi dữ liệu characteristic thất bại (status $status)")
+                failGatt("Characteristic write failed (status $status)")
             }
         }
 
@@ -414,11 +411,11 @@ class BleManager(
         }
     }
 
-    // Xử lý gói tin đến từ TX (PONG, JSON telemetry, binary frame...)
+    // Handle messages arriving on TX characteristic
     private fun handleTxMessage(value: ByteArray) {
         val textValue = try { String(value, Charsets.UTF_8).trim() } catch (_: Exception) { null }
 
-        // 1. Nhận PONG
+        // PONG response
         if (value.contentEquals("PONG".encodeToByteArray()) || textValue == "PONG") {
             val endNs = SystemClock.elapsedRealtimeNanos()
             val rtt = (endNs - requestStartNs) / 1_000_000.0
@@ -426,11 +423,11 @@ class BleManager(
             handler.removeCallbacks(requestTimeout)
             _bleState.value = BleState.DATA_READY
             _rttMs.value = rtt
-            _status.value = "Nhận PONG! RTT = %.2f ms".format(Locale.US, rtt)
+            _status.value = "PONG received! RTT = %.2f ms".format(Locale.US, rtt)
             return
         }
 
-        // 2. Nhận JSON telemetry từ ESP32 (ví dụ: {"phone":200,"esp32":100})
+        // JSON telemetry from ESP32
         if (textValue != null && textValue.startsWith("{") && textValue.endsWith("}")) {
             try {
                 val json = JSONObject(textValue)
@@ -452,7 +449,7 @@ class BleManager(
                 _phoneDelayMs.value = phone
                 _esp32DelayMs.value = esp
                 _status.value = buildString {
-                    append("Đã nhận JSON telemetry!")
+                    append("Received JSON telemetry!")
                     if (phone != null) append(" Phone: ${phone}ms")
                     if (esp != null) append(" | ESP32: ${esp}ms")
                 }
@@ -460,7 +457,7 @@ class BleManager(
             } catch (_: Exception) {}
         }
 
-        // 3. Khung nhị phân SmartKeyProtocol
+        // SmartKeyProtocol binary frame
         val header = SmartKeyProtocol.parseHeader(value)
         if (header != null) {
             val endNs = SystemClock.elapsedRealtimeNanos()
@@ -472,7 +469,7 @@ class BleManager(
                 SmartKeyProtocol.MSG_PONG -> {
                     _bleState.value = BleState.DATA_READY
                     _rttMs.value = rtt
-                    _status.value = "Nhận binary PONG! RTT = %.2f ms".format(Locale.US, rtt)
+                    _status.value = "Binary PONG received! RTT = %.2f ms".format(Locale.US, rtt)
                 }
                 SmartKeyProtocol.MSG_AUTH_RESP -> {
                     val payloadBytes = if (value.size > SmartKeyProtocol.HEADER_SIZE) {
@@ -483,52 +480,52 @@ class BleManager(
                     _sessionId.value = sid
                     _bleState.value = BleState.DATA_READY
                     _rttMs.value = rtt
-                    _status.value = "Nhận AUTH_RESP! Session = $sid (RTT = %.2f ms)".format(Locale.US, rtt)
+                    _status.value = "AUTH_RESP received! Session = $sid (RTT = %.2f ms)".format(Locale.US, rtt)
                 }
                 SmartKeyProtocol.MSG_UWB_CONFIG_RESP -> {
                     _bleState.value = BleState.DATA_READY
-                    _status.value = "Nhận UWB_CONFIG_RESP! Sẵn sàng đo UWB (RTT = %.2f ms)".format(Locale.US, rtt)
+                    _status.value = "UWB_CONFIG_RESP received! Ready for UWB (RTT = %.2f ms)".format(Locale.US, rtt)
                 }
                 SmartKeyProtocol.MSG_ERROR_IND -> {
                     val errCode = if (value.size > SmartKeyProtocol.HEADER_SIZE) value[SmartKeyProtocol.HEADER_SIZE] else SmartKeyProtocol.ERR_INTERNAL_FAULT
                     _bleState.value = BleState.ERROR
-                    _status.value = "ESP32 báo lỗi: " + SmartKeyProtocol.getErrorMessage(errCode)
+                    _status.value = "ESP32 reported error: " + SmartKeyProtocol.getErrorMessage(errCode)
                 }
                 else -> {
-                    _status.value = "Nhận binary msg_type: 0x%02X".format(header.msgType)
+                    _status.value = "Received binary msg_type: 0x%02X".format(header.msgType)
                 }
             }
             return
         }
 
-        // 4. Fallback text hoặc hex byte
+        // Fallback text or raw hex bytes
         if (textValue != null && textValue.isNotEmpty() && textValue.all { it.code in 32..126 || it == '\n' || it == '\r' }) {
             _rawTxPayload.value = textValue
-            _status.value = "Nhận TX text: $textValue"
+            _status.value = "Received TX text: $textValue"
         } else {
             val hex = CryptoManager.toHex(value)
             _rawTxPayload.value = hex
-            _status.value = "Nhận TX raw (${value.size}B): $hex"
+            _status.value = "Received TX raw (${value.size}B): $hex"
         }
     }
 
-    // Xử lý gói tin đến từ Nonce Characteristic (6E400004)
+    // Handle incoming Nonce from ESP32 (...0004)
     private fun handleNonceMessage(value: ByteArray) {
         val hex = CryptoManager.toHex(value)
-        _nonceEvent.value = "ESP32 gửi Nonce (${value.size}B): $hex"
+        _nonceEvent.value = "ESP32 Nonce (${value.size}B): $hex"
 
-        // Băm hoặc ký ECDSA bằng ID_PRIVATE rồi ghi ngược lại 6E400004
+        // Sign challenge nonce with private key (ECDSA P1363 64B) and write response back
         try {
             val privKey = NfcHceBridge.phoneIdentityKeyPair.private
             val signature = CryptoManager.signEcdsaP1363(privKey, value)
             val writeOk = writeNonceResponse(signature)
             if (writeOk) {
-                _nonceEvent.value = "Đã ký ECDSA (64B) và gửi lại qua Nonce characteristic"
+                _nonceEvent.value = "Signed ECDSA (64B) and sent response via Nonce characteristic"
             } else {
-                _nonceEvent.value = "Ký xong nhưng gửi lại Nonce characteristic thất bại"
+                _nonceEvent.value = "Signed successfully but failed to write response to Nonce characteristic"
             }
         } catch (e: Exception) {
-            _nonceEvent.value = "Lỗi xử lý ký Nonce: ${e.message}"
+            _nonceEvent.value = "Nonce signing error: ${e.message}"
         }
     }
 }

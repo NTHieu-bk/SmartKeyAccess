@@ -24,12 +24,10 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.HorizontalDivider
@@ -64,31 +62,31 @@ import com.example.smartkeyaccess.uwb.UwbState
 
 class MainActivity : ComponentActivity() {
 
-    // Các manager phụ trách từng module riêng biệt
+    // Subsystem managers
     private lateinit var bleManager: BleManager
     private lateinit var nfcReaderManager: NfcReaderManager
     private lateinit var uwbManager: UwbManager
 
     private var isNfcReaderEnabled by mutableStateOf(false)
 
-    // Launcher xin quyền Bluetooth và Location
+    // Bluetooth and location permission launcher
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { perms ->
         val allGranted = perms.values.all { it }
         if (!allGranted) {
-            Toast.makeText(this, "Cần cấp quyền Bluetooth để quét ESP32", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "Bluetooth permissions required to scan ESP32", Toast.LENGTH_SHORT).show()
         }
     }
 
-    // Launcher yêu cầu bật Bluetooth nếu đang tắt
+    // Bluetooth enable prompt launcher
     private val enableBtLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
         if (result.resultCode == RESULT_OK) {
             startBleScan()
         } else {
-            Toast.makeText(this, "Bluetooth chưa được bật", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "Bluetooth is disabled", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -202,7 +200,7 @@ class MainActivity : ComponentActivity() {
         val btManager = getSystemService(BluetoothManager::class.java)
         val adapter = btManager?.adapter
         if (adapter == null) {
-            Toast.makeText(this, "Máy không hỗ trợ Bluetooth", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "Device does not support Bluetooth", Toast.LENGTH_SHORT).show()
             return
         }
         if (!adapter.isEnabled) {
@@ -225,7 +223,7 @@ class MainActivity : ComponentActivity() {
     private fun loadMockNfcCredentials() {
         val mock = MockDataProvider.createMockMasterCard(useFirmwareSync = true)
         NfcHceBridge.updateProvisionedCard(mock.vehicleId, mock.masterSecretKey)
-        Toast.makeText(this, "Đã nạp VID + MSK mẫu khớp firmware ESP32", Toast.LENGTH_SHORT).show()
+        Toast.makeText(this, "Loaded mock VID & MSK matching ESP32 firmware", Toast.LENGTH_SHORT).show()
     }
 }
 
@@ -266,7 +264,7 @@ fun SmartKeyMainScreen(
             .verticalScroll(rememberScrollState()),
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
-        // Tiêu đề ứng dụng
+        // App header
         Column {
             Text(
                 text = "Smart Key Access",
@@ -275,13 +273,13 @@ fun SmartKeyMainScreen(
                 color = MaterialTheme.colorScheme.primary
             )
             Text(
-                text = "Hệ thống khoá thông minh chống relay attack (BLE + NFC + UWB)",
+                text = "Anti-relay smart key system (BLE + NFC + UWB)",
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
         }
 
-        // 1. Module NFC Provisioning & HCE
+        // NFC master card and HCE section
         NfcCardSection(
             readerEnabled = nfcReaderEnabled,
             status = nfcStatus,
@@ -292,7 +290,7 @@ fun SmartKeyMainScreen(
             onLoadMock = onLoadMockNfc
         )
 
-        // 2. Module BLE Central Pipeline
+        // BLE central pipeline section
         BleCardSection(
             bleState = bleState,
             status = bleStatus,
@@ -305,7 +303,7 @@ fun SmartKeyMainScreen(
             onSendAuthReq = onSendAuthReq
         )
 
-        // 3. Module Telemetry & Nonce (Characteristic ...0004)
+        // Telemetry and nonce section
         TelemetryCardSection(
             esp32Json = esp32Json,
             phoneDelay = phoneDelay,
@@ -314,7 +312,7 @@ fun SmartKeyMainScreen(
             nonceEvent = nonceEvent
         )
 
-        // 4. Module UWB Ranging
+        // UWB ranging section
         UwbCardSection(
             uwbState = uwbState,
             distanceMeters = distanceMeters,
@@ -327,7 +325,7 @@ fun SmartKeyMainScreen(
     }
 }
 
-// Giao diện thẻ 1: NFC Master Card & HCE Service
+// NFC card and HCE card
 @Composable
 private fun NfcCardSection(
     readerEnabled: Boolean,
@@ -347,22 +345,22 @@ private fun NfcCardSection(
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             Text(
-                text = "1. NFC Master Card & HCE",
+                text = "NFC Master Card & HCE",
                 style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.SemiBold
             )
 
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Button(onClick = onToggleReader) {
-                    Text(if (readerEnabled) "Tắt NFC Reader" else "Bật NFC Reader")
+                    Text(if (readerEnabled) "Disable NFC Reader" else "Enable NFC Reader")
                 }
                 OutlinedButton(onClick = onLoadMock) {
-                    Text("Nạp thẻ mẫu")
+                    Text("Load Mock Card")
                 }
             }
 
             Text(
-                text = "Trạng thái Reader: $status",
+                text = "Reader status: $status",
                 style = MaterialTheme.typography.bodySmall
             )
 
@@ -383,7 +381,7 @@ private fun NfcCardSection(
             HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
 
             Text(
-                text = "Host Card Emulation (PN532 <-> App):",
+                text = "Host Card Emulation (PN532 <-> Phone):",
                 style = MaterialTheme.typography.bodySmall,
                 fontWeight = FontWeight.Bold
             )
@@ -394,7 +392,7 @@ private fun NfcCardSection(
             )
             if (hceVid != null) {
                 Text(
-                    text = "VID đã nạp HCE: ${CryptoManager.toHex(hceVid)}",
+                    text = "HCE VID: ${CryptoManager.toHex(hceVid)}",
                     style = MaterialTheme.typography.bodySmall,
                     fontFamily = FontFamily.Monospace,
                     color = MaterialTheme.colorScheme.primary
@@ -404,7 +402,7 @@ private fun NfcCardSection(
     }
 }
 
-// Giao diện thẻ 2: BLE Central Pipeline
+// BLE central pipeline card
 @Composable
 private fun BleCardSection(
     bleState: BleState,
@@ -431,7 +429,7 @@ private fun BleCardSection(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    text = "2. BLE Central Pipeline",
+                    text = "BLE Central Pipeline",
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.SemiBold
                 )
@@ -451,7 +449,7 @@ private fun BleCardSection(
                     onClick = onScan,
                     enabled = bleState == BleState.READY || bleState == BleState.ERROR
                 ) {
-                    Text("Tìm ESP32")
+                    Text("Scan ESP32")
                 }
                 OutlinedButton(onClick = onReset) {
                     Text("Reset")
@@ -466,7 +464,7 @@ private fun BleCardSection(
                     onClick = onSendPing,
                     enabled = bleState == BleState.DATA_READY
                 ) {
-                    Text("Gửi PING (Đo RTT)")
+                    Text("Send PING (RTT)")
                 }
                 Button(
                     onClick = onSendAuthReq,
@@ -503,7 +501,7 @@ private fun BleCardSection(
     }
 }
 
-// Giao diện thẻ 3: Telemetry JSON & Nonce characteristic
+// Telemetry and nonce card
 @Composable
 private fun TelemetryCardSection(
     esp32Json: String?,
@@ -521,12 +519,11 @@ private fun TelemetryCardSection(
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             Text(
-                text = "3. Telemetry & Nonce (...0004)",
+                text = "Telemetry & Nonce (...0004)",
                 style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.SemiBold
             )
 
-            // Sự kiện Nonce characteristic (...0004)
             if (nonceEvent != null) {
                 Text(
                     text = nonceEvent,
@@ -536,7 +533,7 @@ private fun TelemetryCardSection(
                 )
             } else {
                 Text(
-                    text = "Nonce characteristic (6E400004): Chờ ESP32 notify...",
+                    text = "Nonce characteristic (6E400004): Waiting for ESP32 notify...",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -544,7 +541,6 @@ private fun TelemetryCardSection(
 
             HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
 
-            // Dữ liệu JSON telemetry
             if (esp32Json != null) {
                 Text(
                     text = "JSON: $esp32Json",
@@ -566,7 +562,7 @@ private fun TelemetryCardSection(
                 }
             } else {
                 Text(
-                    text = "Chưa nhận JSON telemetry từ ESP32 qua TX",
+                    text = "No JSON telemetry received yet from ESP32",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -574,7 +570,7 @@ private fun TelemetryCardSection(
 
             if (rawTx != null && rawTx != esp32Json) {
                 Text(
-                    text = "Dữ liệu TX khác: $rawTx",
+                    text = "Raw TX data: $rawTx",
                     style = MaterialTheme.typography.bodySmall,
                     fontFamily = FontFamily.Monospace
                 )
@@ -583,7 +579,7 @@ private fun TelemetryCardSection(
     }
 }
 
-// Giao diện thẻ 4: UWB Ranging Module
+// UWB ranging card
 @Composable
 private fun UwbCardSection(
     uwbState: UwbState,
@@ -606,7 +602,7 @@ private fun UwbCardSection(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    text = "4. UWB Ranging Module",
+                    text = "UWB Ranging",
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.SemiBold
                 )
@@ -647,13 +643,13 @@ private fun UwbCardSection(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text(
-                        text = "Khoảng cách: %.2f m".format(distanceMeters),
+                        text = "Distance: %.2f m".format(distanceMeters),
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold,
                         color = if (distanceMeters <= 1.6f) Color(0xFF2E7D32) else MaterialTheme.colorScheme.error
                     )
                     Text(
-                        text = if (distanceMeters <= 1.6f) "Trong phạm vi (<1.6m)" else "Ngoài phạm vi (>=1.6m)",
+                        text = if (distanceMeters <= 1.6f) "Within unlock range (<1.6m)" else "Out of safe range (>=1.6m)",
                         style = MaterialTheme.typography.bodySmall,
                         fontWeight = FontWeight.Medium
                     )
@@ -663,7 +659,7 @@ private fun UwbCardSection(
     }
 }
 
-// Huy hiệu trạng thái BLE
+// BLE state indicator badge
 @Composable
 private fun StateIndicatorBadge(state: BleState) {
     val color = when (state) {
@@ -697,7 +693,7 @@ fun SmartKeyMainScreenPreview() {
     SmartKeyAccessTheme {
         SmartKeyMainScreen(
             bleState = BleState.DATA_READY,
-            bleStatus = "Đã kết nối! Sẵn sàng nhận dữ liệu từ ESP32.",
+            bleStatus = "Connected! Ready to exchange data with ESP32.",
             rttMs = 18.5,
             mtu = 512,
             sessionId = 0x12345678L,
@@ -705,11 +701,11 @@ fun SmartKeyMainScreenPreview() {
             phoneDelay = 200,
             esp32Delay = 100,
             rawTx = null,
-            nonceEvent = "Đã ký ECDSA (64B) và gửi lại qua Nonce characteristic",
+            nonceEvent = "Signed ECDSA (64B) and sent response via Nonce characteristic",
             nfcReaderEnabled = true,
-            nfcStatus = "NFC Reader đang quét...",
+            nfcStatus = "NFC Reader scanning...",
             provisionedCard = null,
-            hceEvent = "NFC HCE: Sẵn sàng chờ PN532...",
+            hceEvent = "NFC HCE: Ready for PN532...",
             hceVid = null,
             uwbState = UwbState.SUCCESS,
             distanceMeters = 1.15f,
