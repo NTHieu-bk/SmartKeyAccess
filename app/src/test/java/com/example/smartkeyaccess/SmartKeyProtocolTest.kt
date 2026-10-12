@@ -1,7 +1,7 @@
 package com.example.smartkeyaccess
 
 import com.example.smartkeyaccess.crypto.CryptoManager
-import com.example.smartkeyaccess.protocol.SmartKeyProtocol
+import com.example.smartkeyaccess.ble.SmartKeyProtocol
 import org.junit.Assert.*
 import org.junit.Test
 import java.security.interfaces.ECPrivateKey
