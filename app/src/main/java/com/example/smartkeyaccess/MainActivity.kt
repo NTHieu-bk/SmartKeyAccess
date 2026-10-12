@@ -95,8 +95,11 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
 
         bleManager = BleManager(this)
-        nfcReaderManager = NfcReaderManager(lifecycleScope)
-        uwbManager = UwbManager(lifecycleScope)
+        nfcReaderManager = NfcReaderManager(
+            scope = lifecycleScope,
+            onCardProvisioned = { isNfcReaderEnabled = false }
+        )
+        uwbManager = UwbManager()
 
         checkAndRequestPermissions()
 
@@ -120,7 +123,6 @@ class MainActivity : ComponentActivity() {
                 val hceVid by NfcHceBridge.provisionedVehicleId.collectAsState()
 
                 val uwbState by uwbManager.uwbState.collectAsState()
-                val distanceMeters by uwbManager.distanceMeters.collectAsState()
                 val uwbStatus by uwbManager.status.collectAsState()
 
                 Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
@@ -142,7 +144,6 @@ class MainActivity : ComponentActivity() {
                         hceEvent = hceEvent,
                         hceVid = hceVid,
                         uwbState = uwbState,
-                        distanceMeters = distanceMeters,
                         uwbStatus = uwbStatus,
                         onScanBle = { startBleScan() },
                         onResetBle = { bleManager.reset() },
@@ -150,7 +151,7 @@ class MainActivity : ComponentActivity() {
                         onSendAuthReq = { bleManager.sendAuthRequest() },
                         onToggleNfcReader = { toggleNfcReader() },
                         onLoadMockNfc = { loadMockNfcCredentials() },
-                        onTestUwb = { uwbManager.testUwbManual() },
+                        onTestUwb = { uwbManager.startIntegrationTest() },
                         onResetUwb = { uwbManager.reset() }
                     )
                 }
@@ -221,6 +222,12 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun loadMockNfcCredentials() {
+        // Reader Mode disables card emulation. Stop it before provisioning the
+        // explicit integration-test credentials so PN532 can select the HCE AID.
+        if (isNfcReaderEnabled) {
+            nfcReaderManager.stopReader(this)
+            isNfcReaderEnabled = false
+        }
         val mock = MockDataProvider.createMockMasterCard(useFirmwareSync = true)
         NfcHceBridge.updateProvisionedCard(mock.vehicleId, mock.masterSecretKey)
         Toast.makeText(this, "Loaded mock VID & MSK matching ESP32 firmware", Toast.LENGTH_SHORT).show()
@@ -246,7 +253,6 @@ fun SmartKeyMainScreen(
     hceEvent: String,
     hceVid: ByteArray?,
     uwbState: UwbState,
-    distanceMeters: Float?,
     uwbStatus: String,
     onScanBle: () -> Unit,
     onResetBle: () -> Unit,
@@ -312,10 +318,10 @@ fun SmartKeyMainScreen(
             nonceEvent = nonceEvent
         )
 
-        // UWB ranging section
+        // Manual UWB integration trigger. No distance is displayed until a real
+        // Android UWB session and firmware exchange provide a measured result.
         UwbCardSection(
             uwbState = uwbState,
-            distanceMeters = distanceMeters,
             status = uwbStatus,
             onTestUwb = onTestUwb,
             onResetUwb = onResetUwb
@@ -372,7 +378,7 @@ private fun NfcCardSection(
                     fontWeight = FontWeight.Bold
                 )
                 Text(
-                    text = "MSK: ${CryptoManager.toHex(provisionedCard.masterSecretKey).take(16)}... (32B)",
+                    text = "MSK: Loaded / Valid (32B)",
                     style = MaterialTheme.typography.bodySmall,
                     fontFamily = FontFamily.Monospace
                 )
@@ -579,11 +585,11 @@ private fun TelemetryCardSection(
     }
 }
 
-// UWB ranging card
+// UWB integration-test trigger. This card must not claim ranging or distance
+// until the Android UWB session and firmware POLL/RESPONSE/FINAL contract exist.
 @Composable
 private fun UwbCardSection(
     uwbState: UwbState,
-    distanceMeters: Float?,
     status: String,
     onTestUwb: () -> Unit,
     onResetUwb: () -> Unit
@@ -602,7 +608,7 @@ private fun UwbCardSection(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    text = "UWB Ranging",
+                    text = "UWB Integration Test",
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.SemiBold
                 )
@@ -611,9 +617,8 @@ private fun UwbCardSection(
                     style = MaterialTheme.typography.labelSmall,
                     fontWeight = FontWeight.Bold,
                     color = when (uwbState) {
-                        UwbState.SUCCESS -> Color(0xFF2E7D32)
                         UwbState.ERROR -> MaterialTheme.colorScheme.error
-                        UwbState.RANGING -> Color(0xFFE65100)
+                        UwbState.TEST_REQUESTED -> Color(0xFFE65100)
                         UwbState.IDLE -> MaterialTheme.colorScheme.outline
                     }
                 )
@@ -627,34 +632,20 @@ private fun UwbCardSection(
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Button(
                     onClick = onTestUwb,
-                    enabled = uwbState != UwbState.RANGING
+                    enabled = uwbState != UwbState.TEST_REQUESTED
                 ) {
-                    Text("Test UWB (Manual)")
+                    Text("Start UWB Test")
                 }
                 OutlinedButton(onClick = onResetUwb) {
                     Text("Reset UWB")
                 }
             }
 
-            if (distanceMeters != null) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        text = "Distance: %.2f m".format(distanceMeters),
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.Bold,
-                        color = if (distanceMeters <= 1.6f) Color(0xFF2E7D32) else MaterialTheme.colorScheme.error
-                    )
-                    Text(
-                        text = if (distanceMeters <= 1.6f) "Within unlock range (<1.6m)" else "Out of safe range (>=1.6m)",
-                        style = MaterialTheme.typography.bodySmall,
-                        fontWeight = FontWeight.Medium
-                    )
-                }
-            }
+            Text(
+                text = "No distance is produced by the current Mobile implementation.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
         }
     }
 }
@@ -701,15 +692,14 @@ fun SmartKeyMainScreenPreview() {
             phoneDelay = 200,
             esp32Delay = 100,
             rawTx = null,
-            nonceEvent = "Signed ECDSA (64B) and sent response via Nonce characteristic",
+            nonceEvent = "Nonce received (24B); response BLOCKED pending firmware HMAC/signing contract",
             nfcReaderEnabled = true,
             nfcStatus = "NFC Reader scanning...",
             provisionedCard = null,
             hceEvent = "NFC HCE: Ready for PN532...",
             hceVid = null,
-            uwbState = UwbState.SUCCESS,
-            distanceMeters = 1.15f,
-            uwbStatus = "UWB Ranging OK: 1.15m",
+            uwbState = UwbState.TEST_REQUESTED,
+            uwbStatus = "UWB test requested: waiting for firmware/UWB session contract",
             onScanBle = {},
             onResetBle = {},
             onSendPing = {},

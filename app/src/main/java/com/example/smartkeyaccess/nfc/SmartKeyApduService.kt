@@ -3,7 +3,6 @@ package com.example.smartkeyaccess.nfc
 import android.nfc.cardemulation.HostApduService
 import android.os.Bundle
 import com.example.smartkeyaccess.crypto.CryptoManager
-import com.example.smartkeyaccess.mock.MockDataProvider
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -104,7 +103,13 @@ class SmartKeyApduService : HostApduService() {
                         val vid = payload.copyOfRange(0, 8)
                         NfcHceBridge.updateVehicleId(vid)
                     }
-                    val msk = NfcHceBridge.provisionedMsk.value ?: MockDataProvider.FIRMWARE_MSK_32B
+                    // Authentication must fail closed when the physical Master Card
+                    // has not provisioned an MSK. Mock credentials are available only
+                    // through the explicit UI test action, never as an HCE fallback.
+                    val msk = NfcHceBridge.provisionedMsk.value ?: run {
+                        NfcHceBridge.updateEvent("NFC: Authentication rejected - no provisioned MSK")
+                        return SW_CONDITIONS_NOT_SATISFIED
+                    }
                     cachedHmac = CryptoManager.computeHmacSha256(msk, payload)
                     NfcHceBridge.updateEvent("NFC: Received VID + Nonce (${payload.size}B), HMAC computed")
                     SW_SUCCESS

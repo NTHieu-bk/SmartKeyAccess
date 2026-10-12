@@ -3,11 +3,9 @@ package com.example.smartkeyaccess.nfc
 import android.app.Activity
 import android.nfc.NfcAdapter
 import android.nfc.Tag
-import android.nfc.tech.MifareClassic
-import android.nfc.tech.MifareUltralight
-import android.nfc.tech.NfcA
 import android.os.Bundle
 import com.example.smartkeyaccess.crypto.CryptoManager
+import java.lang.ref.WeakReference
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -17,7 +15,8 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 class NfcReaderManager(
-    private val scope: CoroutineScope
+    private val scope: CoroutineScope,
+    private val onCardProvisioned: () -> Unit = {}
 ) : NfcAdapter.ReaderCallback {
 
     private val _status = MutableStateFlow("NFC Reader: Disabled")
@@ -27,6 +26,13 @@ class NfcReaderManager(
     val provisionedCard: StateFlow<MasterCardData?> = _provisionedCard.asStateFlow()
 
     private var isReading = false
+    private var readerActivity = WeakReference<Activity>(null)
+
+    private sealed interface ReadResult {
+        data class Success(val card: MasterCardData) : ReadResult
+        data class Blocked(val technologies: String) : ReadResult
+        data class Failure(val reason: String) : ReadResult
+    }
 
     // Enable reader mode to scan physical contactless cards
     fun startReader(activity: Activity): Boolean {
@@ -52,6 +58,7 @@ class NfcReaderManager(
 
         adapter.enableReaderMode(activity, this, flags, options)
         isReading = true
+        readerActivity = WeakReference(activity)
         _status.value = "Scanning... Tap Master Card to back of device"
         return true
     }
@@ -62,6 +69,7 @@ class NfcReaderManager(
         val adapter = NfcAdapter.getDefaultAdapter(activity)
         adapter?.disableReaderMode(activity)
         isReading = false
+        readerActivity.clear()
         _status.value = "NFC Reader: Disabled"
     }
 
@@ -75,84 +83,47 @@ class NfcReaderManager(
                 readTagData(tag)
             }
 
-            if (result != null && result.isValid()) {
-                _provisionedCard.value = result
-                // Cache VID and MSK in HCE Bridge for subsequent PN532 handshake
-                NfcHceBridge.updateProvisionedCard(result.vehicleId, result.masterSecretKey)
-                _status.value = "Card read successfully! VID: ${CryptoManager.toHex(result.vehicleId)}"
-            } else {
-                _status.value = "Failed to read card or invalid card format"
+            when (result) {
+                is ReadResult.Success -> {
+                    val card = result.card
+                    _provisionedCard.value = card
+                    // Reader Mode disables card emulation while active. After a valid
+                    // card is provisioned, return the NFC adapter to HCE mode before
+                    // the PN532 begins the APDU exchange.
+                    readerActivity.get()?.let { activity ->
+                        NfcAdapter.getDefaultAdapter(activity)?.disableReaderMode(activity)
+                    }
+                    isReading = false
+                    readerActivity.clear()
+                    onCardProvisioned()
+
+                    NfcHceBridge.updateProvisionedCard(card.vehicleId, card.masterSecretKey)
+                    _status.value = "Card read successfully; Reader Mode stopped. VID: ${CryptoManager.toHex(card.vehicleId)}"
+                }
+                is ReadResult.Blocked -> {
+                    _status.value = "Master Card read BLOCKED: firmware must confirm card type, authentication, and block/page layout. Tag: ${result.technologies}"
+                }
+                is ReadResult.Failure -> {
+                    _status.value = "Master Card read failed: ${result.reason}"
+                }
             }
         }
     }
 
-    // Perform I/O on background IO dispatcher
-    private fun readTagData(tag: Tag): MasterCardData? {
+    /**
+     * Detects the physical tag without guessing where credentials are stored.
+     *
+     * The firmware contract has not yet defined the exact card technology,
+     * authentication key, VID block/page, or MSK blocks/pages. Reading sector 1
+     * with the default key or pages 4/8/12 would turn an unconfirmed test layout
+     * into production behavior, so raw I/O intentionally remains blocked here.
+     * Once the contract is frozen, this method should connect to the confirmed
+     * technology, read only the specified raw locations, close the tag in a
+     * `finally` block, and return `ReadResult.Success` after parser validation.
+     */
+    private fun readTagData(tag: Tag): ReadResult {
         val techList = tag.techList.map { it.substringAfterLast(".") }
-
-        // Attempt reading via MifareClassic technology
-        if (techList.contains("MifareClassic")) {
-            val mfc = MifareClassic.get(tag)
-            if (mfc != null) {
-                try {
-                    mfc.connect()
-                    val keyA = MifareClassic.KEY_DEFAULT
-                    val sector = 1
-                    val auth = mfc.authenticateSectorWithKeyA(sector, keyA)
-                    if (auth) {
-                        val firstBlock = mfc.sectorToBlock(sector)
-                        val block0 = mfc.readBlock(firstBlock)
-                        val block1 = mfc.readBlock(firstBlock + 1)
-                        val block2 = mfc.readBlock(firstBlock + 2)
-                        val parsed = MasterCardParser.parseMifareClassic(block0, block1, block2)
-                        if (parsed != null) return parsed
-                    }
-                } catch (_: Exception) {
-                } finally {
-                    try { mfc.close() } catch (_: Exception) {}
-                }
-            }
-        }
-
-        // Attempt reading via MifareUltralight / NTAG
-        if (techList.contains("MifareUltralight")) {
-            val mfu = MifareUltralight.get(tag)
-            if (mfu != null) {
-                try {
-                    mfu.connect()
-                    val chunk1 = mfu.readPages(4)  // pages 4..7 (16B)
-                    val chunk2 = mfu.readPages(8)  // pages 8..11 (16B)
-                    val chunk3 = mfu.readPages(12) // pages 12..15 (16B)
-                    val parsed = MasterCardParser.parseMifareUltralight(chunk1, chunk2, chunk3)
-                    if (parsed != null) return parsed
-                } catch (_: Exception) {
-                } finally {
-                    try { mfu.close() } catch (_: Exception) {}
-                }
-            }
-        }
-
-        // Fallback reading via raw NfcA transceive
-        val nfcA = NfcA.get(tag)
-        if (nfcA != null) {
-            try {
-                nfcA.connect()
-                val cmd = byteArrayOf(0x30.toByte(), 0x04.toByte())
-                val res = nfcA.transceive(cmd)
-                if (res.size >= 16) {
-                    val cmd2 = byteArrayOf(0x30.toByte(), 0x08.toByte())
-                    val res2 = nfcA.transceive(cmd2)
-                    val cmd3 = byteArrayOf(0x30.toByte(), 0x0C.toByte())
-                    val res3 = nfcA.transceive(cmd3)
-                    val parsed = MasterCardParser.parseMifareUltralight(res, res2, res3)
-                    if (parsed != null) return parsed
-                }
-            } catch (_: Exception) {
-            } finally {
-                try { nfcA.close() } catch (_: Exception) {}
-            }
-        }
-
-        return null
+        val detected = if (techList.isEmpty()) "unknown" else techList.joinToString()
+        return ReadResult.Blocked(detected)
     }
 }

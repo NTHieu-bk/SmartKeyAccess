@@ -1,6 +1,6 @@
 # Flowchart M1 — tìm quảng bá ESP32 qua BLE
 
-Sơ đồ này mô tả phần app **đã có** trong `MainActivity.kt`: tìm quảng bá chứa service UUID tham khảo. `FOUND` chỉ nghĩa là đã thấy quảng bá; chưa kết nối GATT, xác thực hay mở khóa.
+Sơ đồ này mô tả phần scan **đã có** trong `BleManager.kt`: tìm quảng bá chứa service UUID tham khảo. `FOUND` chỉ nghĩa là đã thấy quảng bá; sau đó app dừng scan và gọi `connectGatt()`. Trạng thái này chưa có nghĩa là đã xác thực hay mở khóa.
 
 ```mermaid
 flowchart TD
@@ -25,9 +25,9 @@ flowchart TD
     H -- Quảng bá chứa UUID tham khảo --> I[stopScan; hủy giờ; FOUND]
     H -- Thiết bị khác --> H1[Bỏ qua kết quả; tiếp tục chờ]
     H1 --> H
-    H -- Hết 10 giây --> J[stopScan; NOT_FOUND]
+    H -- Hết 10 giây --> J[stopScan; ERROR]
     H -- Scan báo lỗi --> K[stopScan; ERROR_SCAN]
-    I --> L[Chờ bước connectGatt sau này]
+    I --> L[Gọi connectGatt ngay]
     J --> M[Đặt lại SCANNING = false; bấm lại nếu muốn thử]
     K --> M
 ```

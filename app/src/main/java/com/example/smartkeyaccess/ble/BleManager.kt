@@ -17,7 +17,6 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import com.example.smartkeyaccess.crypto.CryptoManager
-import com.example.smartkeyaccess.nfc.NfcHceBridge
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -94,6 +93,16 @@ class BleManager(
     private var scanning = false
     private var requestStartNs = 0L
     private var requestPending = false
+
+    private enum class PendingWrite {
+        RX_APPLICATION,
+        NONCE_RESPONSE
+    }
+
+    // Android completes a remote characteristic write asynchronously through
+    // onCharacteristicWrite(). Keep at most one write in flight so a nonce
+    // response cannot collide with a user-triggered RX write.
+    private var pendingWrite: PendingWrite? = null
 
     // Queue for descriptor writes to avoid GATT command collisions
     private val descriptorWriteQueue = ArrayDeque<BluetoothGattDescriptor>()
@@ -181,6 +190,7 @@ class BleManager(
         notifyChar = null
         nonceChar = null
         requestPending = false
+        pendingWrite = null
 
         try { gatt?.disconnect() } catch (_: Exception) {}
         try { gatt?.close() } catch (_: Exception) {}
@@ -217,7 +227,12 @@ class BleManager(
             failGatt("RX characteristic not found")
             return false
         }
+        if (pendingWrite != null) {
+            onFailed(BluetoothStatusCodes.ERROR_UNKNOWN)
+            return false
+        }
 
+        pendingWrite = PendingWrite.RX_APPLICATION
         val result = try {
             gatt.writeCharacteristic(
                 targetChar,
@@ -229,6 +244,7 @@ class BleManager(
         }
 
         if (result != BluetoothStatusCodes.SUCCESS) {
+            pendingWrite = null
             requestPending = false
             handler.removeCallbacks(requestTimeout)
             onFailed(result)
@@ -237,11 +253,19 @@ class BleManager(
         return true
     }
 
-    // Write response back to Nonce characteristic (6E400004)
+    /**
+     * Queues a future authentication response on the dedicated nonce
+     * characteristic. A return value of true means only that Android accepted
+     * the write request; delivery is confirmed later by onCharacteristicWrite().
+     * The current app does not call this until the firmware team freezes the
+     * HMAC input, ECDSA input, and response wire format.
+     */
     fun writeNonceResponse(response: ByteArray): Boolean {
         val gatt = bluetoothGatt ?: return false
         val targetChar = nonceChar ?: return false
+        if (pendingWrite != null) return false
 
+        pendingWrite = PendingWrite.NONCE_RESPONSE
         val res = try {
             gatt.writeCharacteristic(
                 targetChar,
@@ -251,11 +275,20 @@ class BleManager(
         } catch (_: Exception) {
             BluetoothStatusCodes.ERROR_UNKNOWN
         }
-        return res == BluetoothStatusCodes.SUCCESS
+        if (res != BluetoothStatusCodes.SUCCESS) {
+            pendingWrite = null
+            return false
+        }
+        _nonceEvent.value = "Nonce response queued; waiting for GATT write confirmation"
+        return true
     }
 
     // Send PING to measure OTA round-trip latency
     fun sendPing() {
+        if (requestPending || pendingWrite != null) {
+            _status.value = "BLE request already in progress; wait for its response or timeout"
+            return
+        }
         requestStartNs = SystemClock.elapsedRealtimeNanos()
         requestPending = true
         handler.removeCallbacks(requestTimeout)
@@ -270,6 +303,10 @@ class BleManager(
 
     // Send binary AUTH_REQ frame
     fun sendAuthRequest() {
+        if (requestPending || pendingWrite != null) {
+            _status.value = "BLE request already in progress; wait for its response or timeout"
+            return
+        }
         requestStartNs = SystemClock.elapsedRealtimeNanos()
         requestPending = true
         handler.removeCallbacks(requestTimeout)
@@ -324,8 +361,25 @@ class BleManager(
             notifyChar = service.getCharacteristic(TX_UUID)
             nonceChar = service.getCharacteristic(NONCE_UUID)
 
-            if (writeChar == null || notifyChar == null) {
-                failGatt("Missing required RX or TX characteristic")
+            val rx = writeChar
+            val tx = notifyChar
+            val nonce = nonceChar
+            if (rx == null || tx == null || nonce == null) {
+                failGatt("Missing required RX, TX, or NONCE characteristic")
+                return
+            }
+            if (rx.properties and BluetoothGattCharacteristic.PROPERTY_WRITE == 0) {
+                failGatt("RX characteristic does not support PROPERTY_WRITE")
+                return
+            }
+            if (tx.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY == 0) {
+                failGatt("TX characteristic does not support PROPERTY_NOTIFY")
+                return
+            }
+            val nonceCanNotify = nonce.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY != 0
+            val nonceCanWrite = nonce.properties and BluetoothGattCharacteristic.PROPERTY_WRITE != 0
+            if (!nonceCanNotify || !nonceCanWrite) {
+                failGatt("NONCE characteristic must support PROPERTY_NOTIFY and PROPERTY_WRITE")
                 return
             }
 
@@ -349,26 +403,39 @@ class BleManager(
             _bleState.value = BleState.SUBSCRIBING
             descriptorWriteQueue.clear()
 
-            // Subscribe TX characteristic (6E400003)
-            notifyChar?.let { char ->
-                try {
-                    gatt.setCharacteristicNotification(char, true)
-                    char.getDescriptor(CCCD_UUID)?.let { cccd ->
-                        descriptorWriteQueue.add(cccd)
-                    }
-                } catch (_: Exception) {}
+            val tx = notifyChar ?: run {
+                failGatt("TX characteristic unavailable while subscribing")
+                return
+            }
+            val nonce = nonceChar ?: run {
+                failGatt("NONCE characteristic unavailable while subscribing")
+                return
+            }
+            val txCccd = tx.getDescriptor(CCCD_UUID) ?: run {
+                failGatt("TX CCCD 0x2902 is missing")
+                return
+            }
+            val nonceCccd = nonce.getDescriptor(CCCD_UUID) ?: run {
+                failGatt("NONCE CCCD 0x2902 is missing")
+                return
             }
 
-            // Subscribe Nonce characteristic (6E400004) if present
-            nonceChar?.let { char ->
-                try {
-                    gatt.setCharacteristicNotification(char, true)
-                    char.getDescriptor(CCCD_UUID)?.let { cccd ->
-                        descriptorWriteQueue.add(cccd)
-                    }
-                } catch (_: Exception) {}
+            // Local notification routing must be enabled before writing each
+            // remote CCCD. Both calls are checked because DATA_READY requires
+            // notifications from TX and the dedicated nonce characteristic.
+            val txLocalEnabled = try { gatt.setCharacteristicNotification(tx, true) } catch (_: Exception) { false }
+            if (!txLocalEnabled) {
+                failGatt("Failed to enable local TX notification routing")
+                return
+            }
+            val nonceLocalEnabled = try { gatt.setCharacteristicNotification(nonce, true) } catch (_: Exception) { false }
+            if (!nonceLocalEnabled) {
+                failGatt("Failed to enable local NONCE notification routing")
+                return
             }
 
+            descriptorWriteQueue.add(txCccd)
+            descriptorWriteQueue.add(nonceCccd)
             writeNextDescriptor(gatt)
         }
 
@@ -380,10 +447,14 @@ class BleManager(
             }
 
             val desc = descriptorWriteQueue.removeFirst()
-            try {
+            val result = try {
                 gatt.writeDescriptor(desc, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
             } catch (e: Exception) {
                 failGatt("writeDescriptor failed: ${e.message}")
+                return
+            }
+            if (result != BluetoothStatusCodes.SUCCESS) {
+                failGatt("writeDescriptor request rejected (code $result)")
             }
         }
 
@@ -396,10 +467,17 @@ class BleManager(
         }
 
         override fun onCharacteristicWrite(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
+            val completedWrite = pendingWrite
+            pendingWrite = null
             if (status != BluetoothGatt.GATT_SUCCESS) {
                 requestPending = false
                 handler.removeCallbacks(requestTimeout)
                 failGatt("Characteristic write failed (status $status)")
+                return
+            }
+
+            if (completedWrite == PendingWrite.NONCE_RESPONSE && characteristic.uuid == NONCE_UUID) {
+                _nonceEvent.value = "Nonce response write confirmed by GATT callback"
             }
         }
 
@@ -509,23 +587,14 @@ class BleManager(
         }
     }
 
-    // Handle incoming Nonce from ESP32 (...0004)
+    /**
+     * Receives the raw challenge bytes from the dedicated nonce characteristic.
+     * Transport dispatch is ready, but the authentication response is blocked:
+     * firmware has not yet confirmed the HMAC key/input, ECDSA signing input, or
+     * response byte format. Do not sign the raw nonce or claim authentication.
+     */
     private fun handleNonceMessage(value: ByteArray) {
-        val hex = CryptoManager.toHex(value)
-        _nonceEvent.value = "ESP32 Nonce (${value.size}B): $hex"
-
-        // Sign challenge nonce with private key (ECDSA P1363 64B) and write response back
-        try {
-            val privKey = NfcHceBridge.phoneIdentityKeyPair.private
-            val signature = CryptoManager.signEcdsaP1363(privKey, value)
-            val writeOk = writeNonceResponse(signature)
-            if (writeOk) {
-                _nonceEvent.value = "Signed ECDSA (64B) and sent response via Nonce characteristic"
-            } else {
-                _nonceEvent.value = "Signed successfully but failed to write response to Nonce characteristic"
-            }
-        } catch (e: Exception) {
-            _nonceEvent.value = "Nonce signing error: ${e.message}"
-        }
+        _nonceEvent.value =
+            "Nonce received (${value.size}B); response BLOCKED pending firmware HMAC/signing contract"
     }
 }

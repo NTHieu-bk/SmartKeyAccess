@@ -34,7 +34,7 @@ app/src/main/java/com/example/smartkeyaccess/
     └── MockDataProvider.kt
 ```
 
-> Mã nguồn đã được chuẩn hóa tách module: `MainActivity.kt` chỉ quản lý UI Compose và kết nối các manager; `BleManager` quản lý kết nối GATT, MTU, TX, RX, Nonce; `NfcReaderManager` đọc raw block/page thẻ Master Card; `SmartKeyApduService` xử lý HCE với PN532; `UwbManager` quản lý đo khoảng cách; `CryptoManager` xử lý thuật toán mật mã.
+> Mã nguồn đã được tách theo subsystem: `BleManager` quản lý GATT/MTU/TX/RX/Nonce; `NfcReaderManager` quản lý Reader Mode nhưng chưa đọc credential cho tới khi firmware chốt card layout; `SmartKeyApduService` xử lý HCE với PN532; `UwbManager` hiện chỉ ghi nhận manual integration-test trigger, chưa đo khoảng cách; `CryptoManager` cung cấp các primitive mật mã.
 
 ---
 
@@ -47,6 +47,8 @@ app/src/main/java/com/example/smartkeyaccess/
 - Dừng scan ngay khi tìm thấy thiết bị mục tiêu.
 - Kết nối GATT và khám phá Service/Characteristic.
 - Kiểm tra RX hỗ trợ `WRITE` và TX hỗ trợ `NOTIFY`.
+- Bắt buộc Nonce Characteristic `...0004` hỗ trợ đồng thời `NOTIFY + WRITE`.
+- Bắt buộc TX và Nonce đều có CCCD `0x2902`, sau đó ghi hai descriptor tuần tự.
 - Yêu cầu ATT MTU và tiếp tục hoạt động với MTU mặc định nếu cần.
 - Bật TX Notify bằng CCCD `0x2902`.
 - Gửi dữ liệu tùy ý từ Phone xuống ESP32 qua RX bằng `writeBleFrame()`.
@@ -60,6 +62,7 @@ app/src/main/java/com/example/smartkeyaccess/
 - Phone Identity Key Pair P-256 lưu bằng AndroidKeyStore.
 - ECDSA-SHA256 theo IEEE P1363 `R || S` cho challenge nonce.
 - ECDH P-256 + HKDF helper cho secure session trong milestone sau.
+- Nhận raw nonce riêng qua `...0004`; phần HMAC/ECDSA response đang `BLOCKED BY FIRMWARE CONTRACT` và không tự ký raw nonce.
 
 ### 2.2 Chưa hoàn tất / chưa hardware-verified
 
@@ -116,7 +119,7 @@ Mobile không cần gọi `readCharacteristic()` để nhận dữ liệu thư�
 | Service | `6E400001-B5A3-F393-E0A9-E50E24DCCA9E` | Primary | Smart Key service, dùng để scan/filter |
 | RX Characteristic | `6E400002-B5A3-F393-E0A9-E50E24DCCA9E` | `WRITE` | Phone → ESP32 |
 | TX Characteristic | `6E400003-B5A3-F393-E0A9-E50E24DCCA9E` | `NOTIFY` | ESP32 → Phone |
-| Nonce Characteristic | `6E400004-B5A3-F393-E0A9-E50E24DCCA9E` | `NOTIFY + WRITE` | ESP32 notify Nonce, Phone ký ECDSA P1363 và ghi response |
+| Nonce Characteristic | `6E400004-B5A3-F393-E0A9-E50E24DCCA9E` | `NOTIFY + WRITE` | ESP32 notify raw challenge; Mobile response đang bị chặn cho tới khi chốt HMAC/signing transcript |
 | CCCD | `00002902-0000-1000-8000-00805f9b34fb` | Descriptor | Bật/tắt Notify cho TX và Nonce |
 
 ### Lưu ý về Descriptor
@@ -128,7 +131,7 @@ Trong tài liệu nhóm có nhắc đến CUD `0x2901` để mô tả characteri
 0x2902 = Client Characteristic Configuration Descriptor (CCCD)
 ```
 
-Mobile hiện tại **không dựa vào CUD `0x2901` để phân loại từng packet**. Mobile sử dụng RX/TX làm data path chính, còn `0x2902` được dùng để bật TX Notify.
+Mobile hiện tại **không dựa vào CUD `0x2901` để phân loại từng packet**. UUID của characteristic được dùng để dispatch TX và Nonce; CCCD `0x2902` được dùng để bật Notify cho cả hai characteristic.
 
 ---
 
@@ -154,7 +157,7 @@ DATA_READY
 
 `DATA_READY` trong bản hiện tại có nghĩa là:
 
-> RX/TX đã được discover đúng, MTU đã được xử lý, TX Notify đã được bật thành công và ứng dụng sẵn sàng nhận/gửi application data.
+> RX/TX/NONCE đã được discover đúng property, MTU đã được xử lý, TX và NONCE Notify đã được bật tuần tự qua hai CCCD, và ứng dụng sẵn sàng nhận/gửi application data.
 
 `DATA_READY` **không có nghĩa**:
 
@@ -188,7 +191,7 @@ PING/PONG được giữ lại như một công cụ debug tùy chọn, không c
 
 ## 4.4 BLE Transport Layer
 
-`MainActivity.kt` có hàm chung:
+`BleManager.kt` có hàm chung:
 
 ```text
 writeBleFrame(frame: ByteArray)
@@ -233,10 +236,10 @@ Android Bluetooth Stack
         ↓
 onCharacteristicChanged()
         ↓
-handleBleMessage(value)
+handleTxMessage(value)
 ```
 
-`handleBleMessage()` hiện phân loại dữ liệu theo thứ tự:
+`handleTxMessage()` hiện phân loại dữ liệu TX theo thứ tự; nonce được dispatch riêng sang `handleNonceMessage()` dựa trên UUID `...0004`:
 
 1. `PONG` nếu dùng diagnostic PING/PONG.
 2. JSON telemetry.
@@ -374,7 +377,7 @@ Trong bản hiện tại:
 Do đó trạng thái hiện tại:
 
 ```text
-Physical Master Card provisioning = MOCKED / NOT YET HARDWARE-VERIFIED
+Physical Master Card provisioning = BLOCKED BY CARD TECHNOLOGY / BLOCK-PAGE CONTRACT
 ```
 
 ---
@@ -511,13 +514,13 @@ Sau đó ESP32 gửi `INS_RECE_DATA / P1=0x01`, Mobile trả:
 HMAC 32B || 90 00
 ```
 
-MSK hiện vẫn là:
+MSK chỉ được dùng khi đã provision từ Reader Mode hoặc khi người dùng chủ động bấm `Load Mock Card` cho integration test:
 
 ```text
-MockDataProvider.FIRMWARE_MSK_32B
+NfcHceBridge.provisionedMsk
 ```
 
-Do đó bước này đang là integration test bằng credential mẫu, chưa phải provisioning thương mại.
+HCE không còn tự fallback sang mock MSK. Nếu chưa có MSK được provision, APDU authentication bị từ chối theo hướng fail closed.
 
 ---
 
@@ -744,9 +747,11 @@ Các giá trị này chỉ là **test vectors**, không phải secret thực t�
 | `MOB-BLE-01` | Kiểm tra BLE hardware và runtime permission | `IMPLEMENTED` |
 | `MOB-BLE-02` | Scan Smart Key Service với timeout | `IMPLEMENTED` |
 | `MOB-BLE-03` | Stop scan trước khi connect | `IMPLEMENTED` |
-| `MOB-BLE-04` | Discover Service + RX WRITE + TX NOTIFY | `IMPLEMENTED` |
+| `MOB-BLE-04` | Discover Service + validate RX WRITE + TX NOTIFY + NONCE NOTIFY/WRITE | `IMPLEMENTED` |
 | `MOB-BLE-05` | Request/record MTU và có fallback | `IMPLEMENTED` |
 | `MOB-BLE-06` | Enable TX Notify bằng CCCD `0x2902` | `IMPLEMENTED` |
+| `MOB-BLE-06A` | Enable NONCE Notify bằng CCCD `0x2902`, tuần tự sau TX | `IMPLEMENTED` |
+| `MOB-BLE-06B` | Nonce HMAC/ECDSA response | `BLOCKED BY FIRMWARE CONTRACT` |
 | `MOB-BLE-07` | Sau khi Notify ready, cho phép application traffic mà không bắt buộc PING/PONG | `IMPLEMENTED` |
 | `MOB-BLE-08` | Nhận TX Notify và dispatch payload | `IMPLEMENTED` |
 | `MOB-BLE-09` | Parse JSON telemetry từ ESP32 | `IMPLEMENTED` |
@@ -768,7 +773,7 @@ Các giá trị này chỉ là **test vectors**, không phải secret thực t�
 | `MOB-NFC-08` | Ký challenge bằng ECDSA P-256 | `IMPLEMENTED` |
 | `MOB-NFC-09` | Trả P1363 signature 64B | `IMPLEMENTED` |
 | `MOB-NFC-10` | ESP32 verify chữ ký end-to-end | `UNKNOWN / NEED HARDWARE TEST` |
-| `MOB-NFC-11` | Đọc VID/MSK thật từ Master Card vật lý | `DESIGN / NOT YET IMPLEMENTED` |
+| `MOB-NFC-11` | Đọc VID/MSK thật từ Master Card vật lý | `BLOCKED / WAITING CARD TYPE + BLOCK-PAGE LAYOUT` |
 
 ## 10.3 Crypto
 
@@ -812,7 +817,7 @@ Các giá trị này chỉ là **test vectors**, không phải secret thực t�
 | ECDH/HKDF helper | ✅ | ⏳ end-to-end |
 | AES-GCM | ❌ | ❌ |
 | Physical Master Card read | ❌ | ❌ |
-| UWB | Design | Design |
+| UWB | Manual trigger only; no distance | Waiting firmware/UWB session contract |
 
 ---
 
