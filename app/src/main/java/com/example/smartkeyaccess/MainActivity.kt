@@ -99,7 +99,7 @@ class MainActivity : ComponentActivity() {
             scope = lifecycleScope,
             onCardProvisioned = { isNfcReaderEnabled = false }
         )
-        uwbManager = UwbManager()
+        uwbManager = UwbManager(this)
 
         checkAndRequestPermissions()
 
@@ -618,7 +618,11 @@ private fun UwbCardSection(
                     fontWeight = FontWeight.Bold,
                     color = when (uwbState) {
                         UwbState.ERROR -> MaterialTheme.colorScheme.error
-                        UwbState.TEST_REQUESTED -> Color(0xFFE65100)
+                        UwbState.READY_FOR_PEER, UwbState.IN_RANGE -> Color(0xFF2E7D32)
+                        UwbState.RANGING -> Color(0xFF1976D2)
+                        UwbState.CHECKING, UwbState.OUT_OF_RANGE, UwbState.TIMEOUT -> Color(0xFFE65100)
+                        UwbState.UNSUPPORTED -> Color(0xFF757575)
+                        UwbState.PERMISSION_REQUIRED, UwbState.SERVICE_UNAVAILABLE -> MaterialTheme.colorScheme.error
                         UwbState.IDLE -> MaterialTheme.colorScheme.outline
                     }
                 )
@@ -632,7 +636,7 @@ private fun UwbCardSection(
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Button(
                     onClick = onTestUwb,
-                    enabled = uwbState != UwbState.TEST_REQUESTED
+                    enabled = uwbState != UwbState.CHECKING && uwbState != UwbState.RANGING
                 ) {
                     Text("Start UWB Test")
                 }
@@ -642,7 +646,7 @@ private fun UwbCardSection(
             }
 
             Text(
-                text = "No distance is produced by the current Mobile implementation.",
+                text = "ESP32 Controller coordinates UWB session and enforces final unlock authorization.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -698,8 +702,8 @@ fun SmartKeyMainScreenPreview() {
             provisionedCard = null,
             hceEvent = "NFC HCE: Ready for PN532...",
             hceVid = null,
-            uwbState = UwbState.TEST_REQUESTED,
-            uwbStatus = "UWB test requested: waiting for firmware/UWB session contract",
+            uwbState = UwbState.READY_FOR_PEER,
+            uwbStatus = "UWB Controlee ready: waiting for ESP32 Controller parameters via BLE",
             onScanBle = {},
             onResetBle = {},
             onSendPing = {},

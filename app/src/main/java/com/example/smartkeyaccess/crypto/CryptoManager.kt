@@ -16,8 +16,10 @@ import java.security.spec.ECParameterSpec
 import java.security.spec.ECPoint
 import java.security.spec.ECPublicKeySpec
 import java.util.Locale
+import javax.crypto.Cipher
 import javax.crypto.KeyAgreement
 import javax.crypto.Mac
+import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.SecretKeySpec
 
 object CryptoManager {
@@ -52,6 +54,25 @@ object CryptoManager {
         val ecSpec = ECGenParameterSpec(EC_CURVE_NAME)
         kpg.initialize(ecSpec)
         return kpg.generateKeyPair()
+    }
+
+    /**
+     * SEC1 P-256 raw uncompressed public key, 65 bytes: 0x04 || X(32) || Y(32).
+     * Use this exact encoding for NFC TAG_KEY once the ESP32 contract confirms 65B.
+     * The same encoding can represent a P-256 signing or ECDH public key; it
+     * does NOT mean the two key pairs have the same lifecycle.
+     */
+    fun encodeUncompressedEcPoint(publicKey: ECPublicKey): ByteArray {
+        val xBytes = toUnsigned32Bytes(publicKey.w.affineX)
+        val yBytes = toUnsigned32Bytes(publicKey.w.affineY)
+        return byteArrayOf(0x04.toByte()) + xBytes + yBytes
+    }
+
+    fun decodeUncompressedEcPoint(bytes: ByteArray): ECPublicKey {
+        require(bytes.size == 65 && bytes[0] == 0x04.toByte()) {
+            "Raw uncompressed P-256 point must be exactly 65B and begin with 0x04"
+        }
+        return decodeTlsEcPoint(bytes)
     }
 
     // 66-byte TLS ECPoint format matching ESP32 mbedTLS: 0x41 0x04 || 32B X || 32B Y
@@ -118,6 +139,36 @@ object CryptoManager {
         return t1.copyOf(keyLength)
     }
 
+    /**
+     * AES-128-GCM primitive: returns ciphertext || 16B authentication tag.
+     * Caller MUST use a new unique 12-byte IV for each encryption under a key.
+     * Wire framing / IV transport / AAD must be agreed with ESP32 separately.
+     */
+    fun encryptAes128Gcm(
+        key: ByteArray, iv: ByteArray, plaintext: ByteArray, aad: ByteArray = byteArrayOf()
+    ): ByteArray {
+        require(key.size == 16) { "AES-128 key must be 16B" }
+        require(iv.size == 12) { "GCM IV must be 12B" }
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(128, iv))
+        if (aad.isNotEmpty()) cipher.updateAAD(aad)
+        return cipher.doFinal(plaintext)
+    }
+
+    /** Throws on bad tag / IV / key, rather than returning unauthenticated plaintext. */
+    fun decryptAes128Gcm(
+        key: ByteArray, iv: ByteArray, ciphertextAndTag: ByteArray,
+        aad: ByteArray = byteArrayOf()
+    ): ByteArray {
+        require(key.size == 16) { "AES-128 key must be 16B" }
+        require(iv.size == 12) { "GCM IV must be 12B" }
+        require(ciphertextAndTag.size >= 16) { "Missing 16B GCM tag" }
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(128, iv))
+        if (aad.isNotEmpty()) cipher.updateAAD(aad)
+        return cipher.doFinal(ciphertextAndTag)
+    }
+
     fun toHex(bytes: ByteArray): String =
         bytes.joinToString("") { String.format(Locale.US, "%02X", it) }
 
@@ -134,14 +185,15 @@ object CryptoManager {
     }
 
     private fun toUnsigned32Bytes(value: BigInteger): ByteArray {
-        val raw = value.toByteArray()
-        val result = ByteArray(32)
-        when {
-            raw.size == 32 -> System.arraycopy(raw, 0, result, 0, 32)
-            raw.size > 32 -> System.arraycopy(raw, raw.size - 32, result, 0, 32)
-            else -> System.arraycopy(raw, 0, result, 32 - raw.size, raw.size)
+        require(value.signum() >= 0 && value.bitLength() <= 256) {
+            "P-256 coordinate or signature integer is outside unsigned 256-bit range"
         }
-        return result
+        val raw = value.toByteArray()
+        return ByteArray(32).also { out ->
+            val bytes = if (raw.size == 33 && raw[0] == 0.toByte()) raw.copyOfRange(1, 33) else raw
+            require(bytes.size <= 32)
+            System.arraycopy(bytes, 0, out, 32 - bytes.size, bytes.size)
+        }
     }
 
     private fun getP256ParameterSpec(): ECParameterSpec {
@@ -150,39 +202,33 @@ object CryptoManager {
         return params.getParameterSpec(ECParameterSpec::class.java)
     }
 
-    // Retrieve or create persistent identity key pair in AndroidKeyStore
+    /**
+     * Persistent signing identity. Fail CLOSED when AndroidKeyStore is unavailable.
+     * Never silently generate a replacement in-memory identity on failures:
+     * otherwise ESP32 may have enrolled a different public key.
+     * Host JVM tests should test crypto primitives with generateEcdhKeyPair().
+     */
     fun getOrCreateIdentityKeyPair(): KeyPair {
-        return try {
-            val keyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
-
-            if (!keyStore.containsAlias(PHONE_IDENTITY_KEY_ALIAS)) {
-                val generator = KeyPairGenerator.getInstance(
-                    KeyProperties.KEY_ALGORITHM_EC,
-                    "AndroidKeyStore"
-                )
-
-                val spec = KeyGenParameterSpec.Builder(
-                    PHONE_IDENTITY_KEY_ALIAS,
-                    KeyProperties.PURPOSE_SIGN or KeyProperties.PURPOSE_VERIFY
-                )
-                    .setAlgorithmParameterSpec(ECGenParameterSpec(EC_CURVE_NAME))
-                    .setDigests(KeyProperties.DIGEST_SHA256)
-                    .build()
-
-                generator.initialize(spec)
-                generator.generateKeyPair()
-            }
-
-            val privateKey = (keyStore.getKey(PHONE_IDENTITY_KEY_ALIAS, null) as? java.security.PrivateKey)
-                ?: error("Private key not found in AndroidKeyStore")
-            val publicKey = keyStore.getCertificate(PHONE_IDENTITY_KEY_ALIAS)?.publicKey
-                ?: error("Public key not found in AndroidKeyStore")
-
-            KeyPair(publicKey, privateKey)
-        } catch (_: Exception) {
-            // Fallback for JVM host unit tests where AndroidKeyStore is unavailable
-            generateEcdhKeyPair()
+        val keyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+        if (!keyStore.containsAlias(PHONE_IDENTITY_KEY_ALIAS)) {
+            val generator = KeyPairGenerator.getInstance(
+                KeyProperties.KEY_ALGORITHM_EC, "AndroidKeyStore"
+            )
+            val spec = KeyGenParameterSpec.Builder(
+                PHONE_IDENTITY_KEY_ALIAS,
+                KeyProperties.PURPOSE_SIGN or KeyProperties.PURPOSE_VERIFY
+            )
+                .setAlgorithmParameterSpec(ECGenParameterSpec(EC_CURVE_NAME))
+                .setDigests(KeyProperties.DIGEST_SHA256)
+                .build()
+            generator.initialize(spec)
+            generator.generateKeyPair()
         }
+        val privateKey = keyStore.getKey(PHONE_IDENTITY_KEY_ALIAS, null)
+            as? java.security.PrivateKey ?: error("AndroidKeyStore identity private key missing")
+        val publicKey = keyStore.getCertificate(PHONE_IDENTITY_KEY_ALIAS)?.publicKey
+            as? ECPublicKey ?: error("AndroidKeyStore identity public key missing")
+        return KeyPair(publicKey, privateKey)
     }
 
     fun generateIdentityKeyPair(): KeyPair = getOrCreateIdentityKeyPair()
