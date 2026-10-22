@@ -4,12 +4,11 @@ import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
+import android.os.SystemClock
 import androidx.core.content.ContextCompat
 import androidx.core.uwb.RangingParameters
 import androidx.core.uwb.RangingResult
-import androidx.core.uwb.UwbComplexChannel
 import androidx.core.uwb.UwbControleeSessionScope
-import androidx.core.uwb.UwbDevice
 import androidx.core.uwb.UwbManager as AndroidXUwbManager
 import androidx.core.uwb.exceptions.UwbApiException
 import androidx.core.uwb.exceptions.UwbHardwareNotAvailableException
@@ -20,108 +19,108 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withTimeoutOrNull
+import java.util.Locale
 
-enum class UwbState {
+// Lifecycle state of the UWB Controlee ranging session
+enum class UwbSessionState {
     IDLE,
     CHECKING,
-    READY_FOR_PEER,
-    RANGING,
-    IN_RANGE,
-    OUT_OF_RANGE,
+    CONFIGURED,
+    RANGING_ACTIVE,
+    COMPLETED,
     TIMEOUT,
+    PEER_DISCONNECTED,
     UNSUPPORTED,
     PERMISSION_REQUIRED,
     SERVICE_UNAVAILABLE,
     ERROR
 }
 
-data class UwbSelfTestResult(
-    val androidVersionSupported: Boolean = false,
-    val hardwareSupported: Boolean = false,
-    val permissionGranted: Boolean = false,
-    val serviceAvailable: Boolean = false,
-    val sessionScopeCreated: Boolean = false,
-    val controleeScopeCreated: Boolean = sessionScopeCreated,
-    val localAddress: String? = null,
-    val channel: Int? = null,
-    val preambleIndex: Int? = null,
-    val distanceSupported: Boolean? = null,
-    val azimuthSupported: Boolean? = null,
-    val elevationSupported: Boolean? = null,
-    val supportedChannels: Set<Int> = emptySet(),
-    val supportedConfigIds: Set<Int> = emptySet()
-)
-
-/**
- * UWB Controlee Manager for the smart key system.
- *
- * Responsibilities:
- * - ESP32 acts as the UWB Controller: selects channel/preamble, coordinates session ID and STS,
- *   evaluates distance threshold on firmware, and controls physical lock authorization.
- * - Android Phone acts as the UWB Controlee: generates local UWB address, receives session configuration
- *   from ESP32 over BLE, participates in ranging using UwbControleeSessionScope, manages app-side timeout,
- *   and displays proximity feedback.
- */
+// UWB Controlee Manager: coordinates session lifecycle and receives distance telemetry.
+// Unlock decision and proximity threshold are evaluated by ESP32 Access Authority.
 class UwbManager(context: Context) {
 
     companion object {
-        const val UNLOCK_THRESHOLD_METERS = 1.5f
         const val DEFAULT_RANGING_TIMEOUT_MS = 10000L
+        const val MIN_ANDROID_API = 31
     }
 
     private val appContext = context.applicationContext
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
-    private val _uwbState = MutableStateFlow(UwbState.IDLE)
-    val uwbState: StateFlow<UwbState> = _uwbState.asStateFlow()
+    private val _sessionState = MutableStateFlow(UwbSessionState.IDLE)
+    val sessionState: StateFlow<UwbSessionState> = _sessionState.asStateFlow()
 
-    private val _status = MutableStateFlow("UWB Controlee: Self-test not started")
+    // Backward compatibility alias
+    val uwbState: StateFlow<UwbSessionState> = _sessionState.asStateFlow()
+
+    private val _status = MutableStateFlow("UWB Controlee: Idle")
     val status: StateFlow<String> = _status.asStateFlow()
 
-    private val _selfTestResult = MutableStateFlow(UwbSelfTestResult())
-    val selfTestResult: StateFlow<UwbSelfTestResult> = _selfTestResult.asStateFlow()
+    private val _capabilityReport = MutableStateFlow(UwbCapabilityReport())
+    val capabilityReport: StateFlow<UwbCapabilityReport> = _capabilityReport.asStateFlow()
+
+    // Backward compatibility alias
+    val selfTestReport: StateFlow<UwbCapabilityReport> = _capabilityReport.asStateFlow()
 
     private val _latestDistanceMeters = MutableStateFlow<Float?>(null)
     val latestDistanceMeters: StateFlow<Float?> = _latestDistanceMeters.asStateFlow()
 
-    private val _isWithinUnlockThreshold = MutableStateFlow(false)
-    val isWithinUnlockThreshold: StateFlow<Boolean> = _isWithinUnlockThreshold.asStateFlow()
+    private val _activeSessionLocalAddress = MutableStateFlow<String?>(null)
+    val activeSessionLocalAddress: StateFlow<String?> = _activeSessionLocalAddress.asStateFlow()
 
-    private var cachedControleeScope: UwbControleeSessionScope? = null
     private var activeJob: Job? = null
+    private var activeSessionScope: UwbControleeSessionScope? = null
 
-    fun startIntegrationTest() {
-        if (_uwbState.value == UwbState.CHECKING || _uwbState.value == UwbState.RANGING) return
+    // Check phone's local UWB capabilities in an isolated probe scope
+    fun checkCapabilities() {
+        if (_sessionState.value == UwbSessionState.CHECKING || _sessionState.value == UwbSessionState.RANGING_ACTIVE) return
         activeJob?.cancel()
-        activeJob = scope.launch { runSelfTest() }
+        activeJob = scope.launch {
+            inspectCapabilities()
+        }
     }
 
-    private suspend fun runSelfTest(): UwbControleeSessionScope? {
-        _uwbState.value = UwbState.CHECKING
-        _status.value = "UWB Controlee: Checking Android version, hardware, permission, and service..."
+    // Backward compatibility alias
+    fun startSelfTest() = checkCapabilities()
 
-        val androidOk = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
+    // Run isolated hardware and capability inspection
+    suspend fun inspectCapabilities(): UwbCapabilityReport {
+        _sessionState.value = UwbSessionState.CHECKING
+        _status.value = "Checking UWB hardware capabilities..."
+
+        val androidOk = Build.VERSION.SDK_INT >= MIN_ANDROID_API
         if (!androidOk) {
-            _selfTestResult.value = UwbSelfTestResult(androidVersionSupported = false)
-            _uwbState.value = UwbState.UNSUPPORTED
-            _status.value = "UWB unsupported: Android 12 (API 31) or newer is required."
-            return null
+            val report = UwbCapabilityReport(
+                phoneUwbCapable = false,
+                androidVersionSupported = false,
+                androidApiLevel = Build.VERSION.SDK_INT,
+                diagnosisMessage = "Android 12 (API 31) or newer required for AndroidX UWB."
+            )
+            _capabilityReport.value = report
+            _sessionState.value = UwbSessionState.UNSUPPORTED
+            _status.value = report.diagnosisMessage
+            return report
         }
 
-        val hardwareOk = appContext.packageManager.hasSystemFeature("android.hardware.uwb")
+        val hardwareOk = appContext.packageManager.hasSystemFeature(PackageManager.FEATURE_UWB)
         if (!hardwareOk) {
-            _selfTestResult.value = UwbSelfTestResult(
+            val report = UwbCapabilityReport(
+                phoneUwbCapable = false,
                 androidVersionSupported = true,
-                hardwareSupported = false
+                hardwareSupported = false,
+                diagnosisMessage = "Device does not feature UWB hardware."
             )
-            _uwbState.value = UwbState.UNSUPPORTED
-            _status.value = "UWB unsupported: Device does not feature android.hardware.uwb."
-            return null
+            _capabilityReport.value = report
+            _sessionState.value = UwbSessionState.UNSUPPORTED
+            _status.value = report.diagnosisMessage
+            return report
         }
 
         val permissionOk = ContextCompat.checkSelfPermission(
@@ -130,14 +129,17 @@ class UwbManager(context: Context) {
         ) == PackageManager.PERMISSION_GRANTED
 
         if (!permissionOk) {
-            _selfTestResult.value = UwbSelfTestResult(
+            val report = UwbCapabilityReport(
+                phoneUwbCapable = false,
                 androidVersionSupported = true,
                 hardwareSupported = true,
-                permissionGranted = false
+                permissionGranted = false,
+                diagnosisMessage = "Permission UWB_RANGING not granted."
             )
-            _uwbState.value = UwbState.PERMISSION_REQUIRED
-            _status.value = "UWB permission required: android.permission.UWB_RANGING not granted."
-            return null
+            _capabilityReport.value = report
+            _sessionState.value = UwbSessionState.PERMISSION_REQUIRED
+            _status.value = report.diagnosisMessage
+            return report
         }
 
         return try {
@@ -145,144 +147,323 @@ class UwbManager(context: Context) {
             val available = manager.isAvailable()
 
             if (!available) {
-                _selfTestResult.value = UwbSelfTestResult(
+                val report = UwbCapabilityReport(
+                    phoneUwbCapable = false,
                     androidVersionSupported = true,
                     hardwareSupported = true,
                     permissionGranted = true,
-                    serviceAvailable = false
+                    serviceAvailable = false,
+                    diagnosisMessage = "UWB hardware detected but subsystem is disabled in settings."
                 )
-                _uwbState.value = UwbState.SERVICE_UNAVAILABLE
-                _status.value = "UWB service unavailable: Hardware detected but UWB subsystem is inactive."
-                return null
+                _capabilityReport.value = report
+                _sessionState.value = UwbSessionState.SERVICE_UNAVAILABLE
+                _status.value = report.diagnosisMessage
+                return report
             }
 
-            val controleeScope = manager.controleeSessionScope()
-            cachedControleeScope = controleeScope
-            val caps = controleeScope.rangingCapabilities
+            val probeScope = manager.controleeSessionScope()
+            val caps = probeScope.rangingCapabilities
+            val probeAddress = probeScope.localAddress.toString()
 
-            _selfTestResult.value = UwbSelfTestResult(
+            val firaChannelsSupported = caps.supportedChannels.contains(5) || caps.supportedChannels.contains(9)
+            val firaDsTwrSupported = caps.supportedConfigIds.contains(RangingParameters.CONFIG_UNICAST_DS_TWR)
+            val firaProvisionedDsTwrSupported = caps.supportedConfigIds.contains(RangingParameters.CONFIG_PROVISIONED_UNICAST_DS_TWR)
+            val phoneCapable = firaChannelsSupported && (firaDsTwrSupported || firaProvisionedDsTwrSupported)
+
+            val summary = if (phoneCapable) {
+                "Phone UWB ready (Ch 5/9, Provisioned STS: $firaProvisionedDsTwrSupported, Static STS: $firaDsTwrSupported)."
+            } else {
+                "Phone lacks Channel 5/9 or DS-TWR support."
+            }
+
+            val report = UwbCapabilityReport(
+                phoneUwbCapable = phoneCapable,
                 androidVersionSupported = true,
                 hardwareSupported = true,
                 permissionGranted = true,
                 serviceAvailable = true,
-                sessionScopeCreated = true,
-                localAddress = controleeScope.localAddress.toString(),
-                channel = null,
-                preambleIndex = null,
                 distanceSupported = caps.isDistanceSupported,
                 azimuthSupported = caps.isAzimuthalAngleSupported,
                 elevationSupported = caps.isElevationAngleSupported,
                 supportedChannels = caps.supportedChannels,
-                supportedConfigIds = caps.supportedConfigIds
+                supportedConfigIds = caps.supportedConfigIds,
+                firaChannelsSupported = firaChannelsSupported,
+                firaDsTwrSupported = firaDsTwrSupported,
+                firaProvisionedDsTwrSupported = firaProvisionedDsTwrSupported,
+                localProbeAddress = probeAddress,
+                diagnosisMessage = summary
             )
 
-            _uwbState.value = UwbState.READY_FOR_PEER
-            _status.value = "UWB Controlee ready: Local address [${controleeScope.localAddress}]. Awaiting ESP32 Controller parameters via BLE."
-            controleeScope
+            _capabilityReport.value = report
+            _sessionState.value = UwbSessionState.IDLE
+            _status.value = summary
+            report
 
         } catch (e: UwbHardwareNotAvailableException) {
-            _uwbState.value = UwbState.UNSUPPORTED
-            _status.value = "UWB hardware not available: ${e.message ?: "unknown reason"}"
-            null
+            val report = UwbCapabilityReport(
+                phoneUwbCapable = false,
+                hardwareSupported = false,
+                diagnosisMessage = "UWB hardware not available: ${e.message}"
+            )
+            _capabilityReport.value = report
+            _sessionState.value = UwbSessionState.UNSUPPORTED
+            _status.value = report.diagnosisMessage
+            report
         } catch (e: UwbServiceNotAvailableException) {
-            _uwbState.value = UwbState.SERVICE_UNAVAILABLE
-            _status.value = "UWB service unavailable: ${e.message ?: "unknown reason"}"
-            null
+            val report = UwbCapabilityReport(
+                phoneUwbCapable = false,
+                serviceAvailable = false,
+                diagnosisMessage = "UWB service unavailable: ${e.message}"
+            )
+            _capabilityReport.value = report
+            _sessionState.value = UwbSessionState.SERVICE_UNAVAILABLE
+            _status.value = report.diagnosisMessage
+            report
         } catch (e: SecurityException) {
-            _uwbState.value = UwbState.PERMISSION_REQUIRED
-            _status.value = "UWB permission error: ${e.message ?: "permission denied"}"
-            null
+            val report = UwbCapabilityReport(
+                phoneUwbCapable = false,
+                permissionGranted = false,
+                diagnosisMessage = "Security exception: ${e.message}"
+            )
+            _capabilityReport.value = report
+            _sessionState.value = UwbSessionState.PERMISSION_REQUIRED
+            _status.value = report.diagnosisMessage
+            report
         } catch (e: Exception) {
-            _uwbState.value = UwbState.ERROR
-            _status.value = "UWB initialization failed: ${e.javaClass.simpleName}: ${e.message}"
-            null
+            val report = UwbCapabilityReport(
+                phoneUwbCapable = false,
+                diagnosisMessage = "Error checking capabilities: ${e.message}"
+            )
+            _capabilityReport.value = report
+            _sessionState.value = UwbSessionState.ERROR
+            _status.value = report.diagnosisMessage
+            report
         }
     }
 
-    fun startControleeRanging(
-        peerAddress: String,
-        channel: Int = 9,
-        preambleIndex: Int = 9,
-        sessionId: Int = 0x12345678,
-        timeoutMs: Long = DEFAULT_RANGING_TIMEOUT_MS
+    // Backward compatibility alias
+    suspend fun runHardwareSelfTest(): UwbCapabilityReport = inspectCapabilities()
+
+    // Prepare local controlee scope ahead of session to obtain local UWB address for BLE handshake
+    suspend fun getOrCreateControleeScope(): UwbControleeSessionScope? {
+        activeSessionScope?.let { return it }
+        val manager = try {
+            AndroidXUwbManager.createInstance(appContext)
+        } catch (e: Exception) {
+            _status.value = "Failed to initialize UwbManager: ${e.message}"
+            return null
+        }
+        if (!manager.isAvailable()) {
+            _status.value = "UWB subsystem is unavailable."
+            return null
+        }
+        val controleeScope = try {
+            manager.controleeSessionScope()
+        } catch (e: Exception) {
+            _status.value = "Failed to allocate session scope: ${e.message}"
+            return null
+        }
+        activeSessionScope = controleeScope
+        _activeSessionLocalAddress.value = controleeScope.localAddress.toString()
+        return controleeScope
+    }
+
+    suspend fun getLocalAddressBytes(): ByteArray? {
+        val s = getOrCreateControleeScope() ?: return null
+        return s.localAddress.address
+    }
+
+    // Validate UWB configuration against probed phone hardware capabilities
+    fun validateConfigAgainstCapabilities(config: UwbConfig): String? {
+        val report = _capabilityReport.value
+        if (!report.readyToRange) {
+            return "Phone UWB hardware is not ready for Provisioned STS ranging: ${report.diagnosisMessage}"
+        }
+        if (report.supportedChannels.isNotEmpty() && !report.supportedChannels.contains(config.channel)) {
+            return "Channel ${config.channel} not supported by phone UWB hardware."
+        }
+        if (config.configId == RangingParameters.CONFIG_PROVISIONED_UNICAST_DS_TWR && !report.firaProvisionedDsTwrSupported) {
+            return "Phone hardware does not support CONFIG_PROVISIONED_UNICAST_DS_TWR (Provisioned STS)."
+        }
+        if (report.supportedConfigIds.isNotEmpty() && !report.supportedConfigIds.contains(config.configId)) {
+            return "Config profile ${config.configId} not supported by phone hardware."
+        }
+        return null
+    }
+
+    // Start UWB Controlee ranging session using parameters coordinated with ESP32
+    fun startRanging(
+        config: UwbConfig,
+        inactivityTimeoutMs: Long = 8000L
     ) {
-        if (_uwbState.value == UwbState.RANGING) return
+        if (_sessionState.value == UwbSessionState.RANGING_ACTIVE) return
+
+        if (!config.isValid()) {
+            _sessionState.value = UwbSessionState.ERROR
+            _status.value = "Invalid UWB configuration parameters."
+            return
+        }
+
         activeJob?.cancel()
         activeJob = scope.launch {
-            val sessionScope = cachedControleeScope ?: runSelfTest()
-            if (sessionScope == null) return@launch
+            purgeDistance()
 
-            _uwbState.value = UwbState.RANGING
-            _status.value = "UWB Controlee ranging with ESP32 [$peerAddress] (ch $channel)..."
+            // Automatically inspect capabilities if not yet probed
+            if (_capabilityReport.value.diagnosisMessage == "UWB capability check not run yet") {
+                inspectCapabilities()
+            }
+
+            val capErr = validateConfigAgainstCapabilities(config)
+            if (capErr != null) {
+                _sessionState.value = UwbSessionState.ERROR
+                _status.value = "Hardware compatibility error: $capErr"
+                return@launch
+            }
+
+            val sessionScope = activeSessionScope ?: getOrCreateControleeScope() ?: run {
+                _sessionState.value = UwbSessionState.ERROR
+                _status.value = "Failed to obtain UWB controlee session scope."
+                return@launch
+            }
+
+            val localAddrStr = sessionScope.localAddress.toString()
+            _activeSessionLocalAddress.value = localAddrStr
+            _sessionState.value = UwbSessionState.RANGING_ACTIVE
+            _status.value = String.format(
+                Locale.US,
+                "Ranging: Local [%s] <-> ESP32 [%s] (Ch %d, Session 0x%08X)...",
+                localAddrStr, config.peerAddressHex, config.channel, config.sessionId
+            )
+
+            // Monotonic watchdog tracking valid distance measurements from ESP32
+            val lastValidDistanceMonoNs = java.util.concurrent.atomic.AtomicLong(SystemClock.elapsedRealtimeNanos())
+            val watchdogJob = launch {
+                while (isActive) {
+                    delay(500L)
+                    val idleMs = (SystemClock.elapsedRealtimeNanos() - lastValidDistanceMonoNs.get()) / 1_000_000L
+                    if (idleMs > inactivityTimeoutMs) {
+                        _sessionState.value = UwbSessionState.TIMEOUT
+                        _status.value = "UWB Ranging Timeout: No valid distance measurements received for ${idleMs}ms (watchdog limit ${inactivityTimeoutMs}ms)."
+                        purgeDistance()
+                        activeSessionScope = null
+                        activeJob?.cancel(CancellationException("Inactivity watchdog timeout"))
+                        break
+                    }
+                }
+            }
 
             try {
-                val complexChannel = UwbComplexChannel(channel, preambleIndex)
-                val peerDevice = UwbDevice.createForAddress(peerAddress)
+                val complexChannel = config.toUwbComplexChannel()
+                val peerDevice = config.toUwbDevice()
+
                 val rangingParameters = RangingParameters(
-                    uwbConfigType = RangingParameters.CONFIG_UNICAST_DS_TWR,
-                    sessionId = sessionId,
-                    subSessionId = 0,
-                    sessionKeyInfo = null,
-                    subSessionKeyInfo = null,
+                    uwbConfigType = config.configId,
+                    sessionId = config.sessionId,
+                    subSessionId = config.subSessionId,
+                    sessionKeyInfo = config.sessionKeyInfo,
+                    subSessionKeyInfo = config.subSessionKeyInfo,
                     complexChannel = complexChannel,
                     peerDevices = listOf(peerDevice),
-                    updateRateType = RangingParameters.RANGING_UPDATE_RATE_FREQUENT
+                    updateRateType = config.updateRateType
                 )
 
-                val completedNormally = withTimeoutOrNull(timeoutMs) {
-                    sessionScope.prepareSession(rangingParameters).collect { result ->
-                        when (result) {
-                            is RangingResult.RangingResultPosition -> {
-                                val distance = result.position.distance?.value
-                                if (distance != null) {
-                                    _latestDistanceMeters.value = distance
-                                    val inRange = distance <= UNLOCK_THRESHOLD_METERS
-                                    _isWithinUnlockThreshold.value = inRange
-                                    _uwbState.value = if (inRange) UwbState.IN_RANGE else UwbState.OUT_OF_RANGE
-                                    _status.value = "Distance: %.2fm (%s). ESP32 firmware holds unlock authority.".format(
-                                        distance,
-                                        if (inRange) "Within unlock threshold" else "Outside threshold"
-                                    )
-                                }
+                sessionScope.prepareSession(rangingParameters).collect { result ->
+                    when (result) {
+                        is RangingResult.RangingResultPosition -> {
+                            val distance = result.position.distance?.value
+                            if (distance != null && distance.isFinite() && distance >= 0f) {
+                                lastValidDistanceMonoNs.set(SystemClock.elapsedRealtimeNanos())
+                                _latestDistanceMeters.value = distance
+                                _status.value = String.format(
+                                    Locale.US,
+                                    "Distance: %.2fm (Access Authority: ESP32)",
+                                    distance
+                                )
                             }
-                            is RangingResult.RangingResultPeerDisconnected -> {
-                                _status.value = "ESP32 Controller disconnected from UWB session."
-                            }
-                            is RangingResult.RangingResultInitialized -> {
-                                _status.value = "UWB session initialized with ESP32 Controller."
+                        }
+                        is RangingResult.RangingResultPeerDisconnected -> {
+                            _status.value = "ESP32 disconnected from UWB session."
+                            _sessionState.value = UwbSessionState.PEER_DISCONNECTED
+                            purgeDistance()
+                            activeSessionScope = null
+                            throw CancellationException("ESP32 peer disconnected")
+                        }
+                        is RangingResult.RangingResultInitialized -> {
+                            _status.value = "UWB session initialized with ESP32. Awaiting pulses..."
+                        }
+                        else -> {
+                            // Explicit handling for RangingResultFailure or platform-specific ranging interruptions
+                            if (result.javaClass.simpleName.contains("Failure")) {
+                                _status.value = "UWB ranging failure reported by stack (${result.javaClass.simpleName})."
+                                _sessionState.value = UwbSessionState.ERROR
+                                purgeDistance()
+                                activeSessionScope = null
+                                activeJob?.cancel(CancellationException("UWB ranging failure: ${result.javaClass.simpleName}"))
                             }
                         }
                     }
                 }
 
-                if (completedNormally == null) {
-                    _uwbState.value = UwbState.TIMEOUT
-                    _status.value = "UWB ranging timed out after ${timeoutMs}ms. Physical lock remains secure."
+                if (_sessionState.value == UwbSessionState.RANGING_ACTIVE) {
+                    _sessionState.value = UwbSessionState.COMPLETED
                 }
+
             } catch (e: CancellationException) {
-                // Ranging cancelled gracefully
+                if (_sessionState.value != UwbSessionState.PEER_DISCONNECTED && _sessionState.value != UwbSessionState.TIMEOUT) {
+                    _status.value = "UWB session ended."
+                }
+                purgeDistance()
             } catch (e: UwbApiException) {
-                _uwbState.value = UwbState.ERROR
+                _sessionState.value = UwbSessionState.ERROR
+                purgeDistance()
                 _status.value = "UWB API error: ${e.message}"
             } catch (e: Exception) {
-                _uwbState.value = UwbState.ERROR
-                _status.value = "UWB ranging failed: ${e.javaClass.simpleName}: ${e.message}"
+                _sessionState.value = UwbSessionState.ERROR
+                purgeDistance()
+                _status.value = "UWB ranging failed: ${e.message}"
+            } finally {
+                watchdogJob.cancel()
+                _activeSessionLocalAddress.value = null
+                activeSessionScope = null
             }
         }
     }
 
-    fun reset() {
+    // Backward compatibility alias
+    fun startControleeRanging(
+        config: UwbConfig,
+        timeoutMs: Long = DEFAULT_RANGING_TIMEOUT_MS
+    ) = startRanging(config, timeoutMs)
+
+    // Stop ranging session and clear distance telemetry
+    fun stopRanging() {
         activeJob?.cancel()
         activeJob = null
-        _latestDistanceMeters.value = null
-        _isWithinUnlockThreshold.value = false
-        _uwbState.value = UwbState.IDLE
-        _selfTestResult.value = UwbSelfTestResult()
-        _status.value = "UWB Controlee: Self-test not started"
+        activeSessionScope = null
+        if (_sessionState.value == UwbSessionState.RANGING_ACTIVE) {
+            _sessionState.value = UwbSessionState.IDLE
+        }
+        purgeDistance()
+        _activeSessionLocalAddress.value = null
     }
 
-    fun close() {
-        activeJob?.cancel()
+    // Clear distance telemetry (Mobile does not evaluate unlock decision)
+    private fun purgeDistance() {
+        _latestDistanceMeters.value = null
+    }
+
+    // Reset manager to idle state
+    fun reset() {
+        stopRanging()
+        _capabilityReport.value = UwbCapabilityReport()
+        _sessionState.value = UwbSessionState.IDLE
+        _status.value = "UWB Controlee: Idle"
+    }
+
+    fun cleanup() {
+        stopRanging()
         scope.cancel()
     }
+
+    fun close() = cleanup()
 }

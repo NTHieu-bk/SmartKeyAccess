@@ -36,6 +36,7 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -49,6 +50,7 @@ import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
+import com.example.smartkeyaccess.ble.BleCapabilityReport
 import com.example.smartkeyaccess.ble.BleManager
 import com.example.smartkeyaccess.ble.BleState
 import com.example.smartkeyaccess.crypto.CryptoManager
@@ -57,8 +59,13 @@ import com.example.smartkeyaccess.nfc.MasterCardData
 import com.example.smartkeyaccess.nfc.NfcHceBridge
 import com.example.smartkeyaccess.nfc.NfcReaderManager
 import com.example.smartkeyaccess.ui.theme.SmartKeyAccessTheme
+import com.example.smartkeyaccess.protocol.SmartKeyProtocol
+import com.example.smartkeyaccess.uwb.UwbCapabilityReport
+import com.example.smartkeyaccess.uwb.UwbConfig
 import com.example.smartkeyaccess.uwb.UwbManager
-import com.example.smartkeyaccess.uwb.UwbState
+import com.example.smartkeyaccess.uwb.UwbSessionState
+import java.util.Locale
+import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
 
@@ -75,7 +82,7 @@ class MainActivity : ComponentActivity() {
     ) { perms ->
         val allGranted = perms.values.all { it }
         if (!allGranted) {
-            Toast.makeText(this, "Bluetooth permissions required to scan ESP32", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "Permissions (Bluetooth / UWB) required for full operation", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -97,7 +104,12 @@ class MainActivity : ComponentActivity() {
         bleManager = BleManager(this)
         nfcReaderManager = NfcReaderManager(
             scope = lifecycleScope,
-            onCardProvisioned = { isNfcReaderEnabled = false }
+            onCardProvisioned = {
+                isNfcReaderEnabled = false
+                nfcReaderManager.provisionedCard.value?.masterSecretKey?.let {
+                    bleManager.setMasterKey(it)
+                }
+            }
         )
         uwbManager = UwbManager(this)
 
@@ -107,9 +119,11 @@ class MainActivity : ComponentActivity() {
             SmartKeyAccessTheme {
                 val bleState by bleManager.bleState.collectAsState()
                 val bleStatus by bleManager.status.collectAsState()
+                val bleCapabilityReport by bleManager.capabilityReport.collectAsState()
                 val rttMs by bleManager.rttMs.collectAsState()
                 val mtu by bleManager.negotiatedMtu.collectAsState()
                 val sessionId by bleManager.sessionId.collectAsState()
+                val esp32UwbConfig by bleManager.esp32UwbConfig.collectAsState()
 
                 val esp32Json by bleManager.esp32JsonPayload.collectAsState()
                 val phoneDelay by bleManager.phoneDelayMs.collectAsState()
@@ -122,8 +136,18 @@ class MainActivity : ComponentActivity() {
                 val hceEvent by NfcHceBridge.eventFlow.collectAsState()
                 val hceVid by NfcHceBridge.provisionedVehicleId.collectAsState()
 
-                val uwbState by uwbManager.uwbState.collectAsState()
+                val uwbSessionState by uwbManager.sessionState.collectAsState()
                 val uwbStatus by uwbManager.status.collectAsState()
+                val capabilityReport by uwbManager.capabilityReport.collectAsState()
+                val rawDistance by uwbManager.latestDistanceMeters.collectAsState()
+                val activeSessionLocalAddress by uwbManager.activeSessionLocalAddress.collectAsState()
+
+                // Stop UWB ranging immediately if BLE disconnects or encounters error
+                LaunchedEffect(bleState) {
+                    if (bleState == BleState.READY || bleState == BleState.ERROR) {
+                        uwbManager.stopRanging()
+                    }
+                }
 
                 Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
                     SmartKeyMainScreen(
@@ -133,6 +157,7 @@ class MainActivity : ComponentActivity() {
                         rttMs = rttMs,
                         mtu = mtu,
                         sessionId = sessionId,
+                        uwbConfig = esp32UwbConfig,
                         esp32Json = esp32Json,
                         phoneDelay = phoneDelay,
                         esp32Delay = esp32Delay,
@@ -143,15 +168,39 @@ class MainActivity : ComponentActivity() {
                         provisionedCard = provisionedCard,
                         hceEvent = hceEvent,
                         hceVid = hceVid,
-                        uwbState = uwbState,
+                        bleCapabilityReport = bleCapabilityReport,
+                        uwbSessionState = uwbSessionState,
                         uwbStatus = uwbStatus,
+                        capabilityReport = capabilityReport,
+                        rawDistance = rawDistance,
+                        activeSessionLocalAddress = activeSessionLocalAddress,
                         onScanBle = { startBleScan() },
                         onResetBle = { bleManager.reset() },
+                        onCheckBleCapabilities = { bleManager.checkCapabilities() },
                         onSendPing = { bleManager.sendPing() },
                         onSendAuthReq = { bleManager.sendAuthRequest() },
+                        onSendUwbConfigReq = {
+                            lifecycleScope.launch {
+                                val phoneAddr = uwbManager.getLocalAddressBytes()
+                                if (phoneAddr == null || (phoneAddr.size != 2 && phoneAddr.size != 8)) {
+                                    Toast.makeText(this@MainActivity, "Cannot obtain valid local UWB address from phone. Check UWB subsystem.", Toast.LENGTH_LONG).show()
+                                    return@launch
+                                }
+                                bleManager.sendUwbConfigRequest(phoneUwbAddress = phoneAddr)
+                            }
+                        },
                         onToggleNfcReader = { toggleNfcReader() },
                         onLoadMockNfc = { loadMockNfcCredentials() },
-                        onTestUwb = { uwbManager.startIntegrationTest() },
+                        onCheckCapabilities = { uwbManager.checkCapabilities() },
+                        onStartRanging = {
+                            val cfg = esp32UwbConfig
+                            if (cfg != null && bleState == BleState.UWB_CONFIG_CONFIRMED) {
+                                uwbManager.startRanging(cfg)
+                            } else {
+                                Toast.makeText(this@MainActivity, "Exchange UWB parameters and confirm with ESP32 first", Toast.LENGTH_SHORT).show()
+                            }
+                        },
+                        onStopRanging = { uwbManager.stopRanging() },
                         onResetUwb = { uwbManager.reset() }
                     )
                 }
@@ -173,9 +222,15 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onStop() {
+        super.onStop()
+        uwbManager.stopRanging()
+    }
+
     override fun onDestroy() {
         super.onDestroy()
         bleManager.reset()
+        uwbManager.cleanup()
     }
 
     private fun checkAndRequestPermissions() {
@@ -187,9 +242,9 @@ class MainActivity : ComponentActivity() {
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
                 needed.add(Manifest.permission.BLUETOOTH_CONNECT)
             }
-        }
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.NFC) != PackageManager.PERMISSION_GRANTED) {
-            needed.add(Manifest.permission.NFC)
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.UWB_RANGING) != PackageManager.PERMISSION_GRANTED) {
+                needed.add(Manifest.permission.UWB_RANGING)
+            }
         }
         if (needed.isNotEmpty()) {
             permissionLauncher.launch(needed.toTypedArray())
@@ -230,6 +285,7 @@ class MainActivity : ComponentActivity() {
         }
         val mock = MockDataProvider.createMockMasterCard(useFirmwareSync = true)
         NfcHceBridge.updateProvisionedCard(mock.vehicleId, mock.masterSecretKey)
+        bleManager.setMasterKey(mock.masterSecretKey)
         Toast.makeText(this, "Loaded mock VID & MSK matching ESP32 firmware", Toast.LENGTH_SHORT).show()
     }
 }
@@ -242,6 +298,7 @@ fun SmartKeyMainScreen(
     rttMs: Double?,
     mtu: Int,
     sessionId: Long?,
+    uwbConfig: UwbConfig?,
     esp32Json: String?,
     phoneDelay: Int?,
     esp32Delay: Int?,
@@ -252,15 +309,23 @@ fun SmartKeyMainScreen(
     provisionedCard: MasterCardData?,
     hceEvent: String,
     hceVid: ByteArray?,
-    uwbState: UwbState,
+    bleCapabilityReport: BleCapabilityReport,
+    uwbSessionState: UwbSessionState,
     uwbStatus: String,
+    capabilityReport: UwbCapabilityReport,
+    rawDistance: Float?,
+    activeSessionLocalAddress: String?,
     onScanBle: () -> Unit,
     onResetBle: () -> Unit,
+    onCheckBleCapabilities: () -> Unit,
     onSendPing: () -> Unit,
     onSendAuthReq: () -> Unit,
+    onSendUwbConfigReq: () -> Unit,
     onToggleNfcReader: () -> Unit,
     onLoadMockNfc: () -> Unit,
-    onTestUwb: () -> Unit,
+    onCheckCapabilities: () -> Unit,
+    onStartRanging: () -> Unit,
+    onStopRanging: () -> Unit,
     onResetUwb: () -> Unit
 ) {
     Column(
@@ -309,6 +374,12 @@ fun SmartKeyMainScreen(
             onSendAuthReq = onSendAuthReq
         )
 
+        // BLE hardware and capability diagnostic section
+        BleDiagnosticCardSection(
+            report = bleCapabilityReport,
+            onCheckBleCapabilities = onCheckBleCapabilities
+        )
+
         // Telemetry and nonce section
         TelemetryCardSection(
             esp32Json = esp32Json,
@@ -318,12 +389,25 @@ fun SmartKeyMainScreen(
             nonceEvent = nonceEvent
         )
 
-        // Manual UWB integration trigger. No distance is displayed until a real
-        // Android UWB session and firmware exchange provide a measured result.
-        UwbCardSection(
-            uwbState = uwbState,
+        // Hardware capability diagnostic section
+        UwbDiagnosticCardSection(
+            report = capabilityReport,
             status = uwbStatus,
-            onTestUwb = onTestUwb,
+            sessionState = uwbSessionState,
+            onCheckCapabilities = onCheckCapabilities
+        )
+
+        // UWB live ranging section
+        UwbControleeRangingCardSection(
+            bleState = bleState,
+            sessionState = uwbSessionState,
+            status = uwbStatus,
+            uwbConfig = uwbConfig,
+            rawDistance = rawDistance,
+            activeLocalAddress = activeSessionLocalAddress,
+            onStartRanging = onStartRanging,
+            onStopRanging = onStopRanging,
+            onSendUwbConfigReq = onSendUwbConfigReq,
             onResetUwb = onResetUwb
         )
 
@@ -455,7 +539,7 @@ private fun BleCardSection(
                     onClick = onScan,
                     enabled = bleState == BleState.READY || bleState == BleState.ERROR
                 ) {
-                    Text("Scan ESP32")
+                    Text("Connect ESP32")
                 }
                 OutlinedButton(onClick = onReset) {
                     Text("Reset")
@@ -468,7 +552,7 @@ private fun BleCardSection(
             ) {
                 Button(
                     onClick = onSendPing,
-                    enabled = bleState == BleState.DATA_READY
+                    enabled = bleState == BleState.DATA_READY || bleState == BleState.AUTHENTICATED || bleState == BleState.UWB_CONFIG_CONFIRMED
                 ) {
                     Text("Send PING (RTT)")
                 }
@@ -489,7 +573,7 @@ private fun BleCardSection(
                     style = MaterialTheme.typography.bodySmall
                 )
                 Text(
-                    text = rttMs?.let { "RTT: %.2f ms".format(it) } ?: "RTT: --",
+                    text = rttMs?.let { "RTT: %.2f ms".format(Locale.US, it) } ?: "RTT: --",
                     style = MaterialTheme.typography.bodySmall,
                     fontWeight = FontWeight.Bold,
                     color = MaterialTheme.colorScheme.primary
@@ -503,6 +587,68 @@ private fun BleCardSection(
                     fontFamily = FontFamily.Monospace
                 )
             }
+        }
+    }
+}
+
+// BLE Hardware and capability diagnostic card
+@Composable
+private fun BleDiagnosticCardSection(
+    report: BleCapabilityReport,
+    onCheckBleCapabilities: () -> Unit
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "BLE Capability & Diagnostics",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Text(
+                    text = if (report.readyToScan) "READY" else "DIAGNOSTIC",
+                    style = MaterialTheme.typography.labelSmall,
+                    fontWeight = FontWeight.Bold,
+                    color = if (report.readyToScan) Color(0xFF2E7D32) else MaterialTheme.colorScheme.primary
+                )
+            }
+
+            Text(
+                text = report.diagnosisMessage,
+                style = MaterialTheme.typography.bodySmall
+            )
+
+            Button(onClick = onCheckBleCapabilities) {
+                Text("Check BLE Capabilities")
+            }
+
+            HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
+            Text(
+                text = "• BLE Hardware Supported: " + if (report.hardwareSupported) "YES" else "NO",
+                style = MaterialTheme.typography.bodySmall
+            )
+            Text(
+                text = "• Bluetooth Adapter Enabled: " + if (report.bluetoothEnabled) "YES" else "NO",
+                style = MaterialTheme.typography.bodySmall
+            )
+            Text(
+                text = "• Scan Permission: " + if (report.scanPermissionGranted) "GRANTED" else "DENIED",
+                style = MaterialTheme.typography.bodySmall
+            )
+            Text(
+                text = "• Connect Permission: " + if (report.connectPermissionGranted) "GRANTED" else "DENIED",
+                style = MaterialTheme.typography.bodySmall
+            )
         }
     }
 }
@@ -585,13 +731,113 @@ private fun TelemetryCardSection(
     }
 }
 
-// UWB integration-test trigger. This card must not claim ranging or distance
-// until the Android UWB session and firmware POLL/RESPONSE/FINAL contract exist.
+// UWB Hardware & FiRa Compatibility Diagnostic Section
 @Composable
-private fun UwbCardSection(
-    uwbState: UwbState,
+private fun UwbDiagnosticCardSection(
+    report: UwbCapabilityReport,
     status: String,
-    onTestUwb: () -> Unit,
+    sessionState: UwbSessionState,
+    onCheckCapabilities: () -> Unit
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "UWB Capability & Diagnostics",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Text(
+                    text = if (report.phoneUwbCapable) "PHONE READY" else if (sessionState == UwbSessionState.CHECKING) "CHECKING" else "DIAGNOSTIC",
+                    style = MaterialTheme.typography.labelSmall,
+                    fontWeight = FontWeight.Bold,
+                    color = if (report.phoneUwbCapable) Color(0xFF2E7D32) else MaterialTheme.colorScheme.primary
+                )
+            }
+
+            Text(
+                text = status,
+                style = MaterialTheme.typography.bodySmall
+            )
+
+            Button(
+                onClick = onCheckCapabilities,
+                enabled = sessionState != UwbSessionState.CHECKING && sessionState != UwbSessionState.RANGING_ACTIVE
+            ) {
+                Text(if (sessionState == UwbSessionState.CHECKING) "Diagnosing..." else "Check Capabilities")
+            }
+
+            if (report.androidVersionSupported) {
+                HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
+                Text(
+                    text = "Capability Diagnostic Results:",
+                    style = MaterialTheme.typography.bodySmall,
+                    fontWeight = FontWeight.Bold
+                )
+                Text(
+                    text = "• Android API: ${report.androidApiLevel} (Target >= 31): OK",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                Text(
+                    text = "• Hardware Feature (android.hardware.uwb): " + if (report.hardwareSupported) "DETECTED" else "NOT PRESENT",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                Text(
+                    text = "• Permission UWB_RANGING: " + if (report.permissionGranted) "GRANTED" else "NOT GRANTED",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                Text(
+                    text = "• Subsystem Active: " + if (report.serviceAvailable) "AVAILABLE" else "DISABLED / UNAVAILABLE",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                if (report.serviceAvailable) {
+                    Text(
+                        text = "• Supported Channels: ${report.supportedChannels} (FiRa Ch 5/9: ${if (report.firaChannelsSupported) "YES" else "NO"})",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                    Text(
+                        text = "• FiRa Unicast DS-TWR Config: " + if (report.firaDsTwrSupported) "SUPPORTED" else "NOT SUPPORTED",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                    Text(
+                        text = "• AoA Angles: Azimuth=${report.azimuthSupported ?: false}, Elevation=${report.elevationSupported ?: false}",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+            }
+
+            HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
+            Text(
+                text = report.firaComplianceNotice,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+    }
+}
+
+// UWB Controlee live ranging and distance decision policy card
+@Composable
+private fun UwbControleeRangingCardSection(
+    bleState: BleState,
+    sessionState: UwbSessionState,
+    status: String,
+    uwbConfig: UwbConfig?,
+    rawDistance: Float?,
+    activeLocalAddress: String?,
+    onStartRanging: () -> Unit,
+    onStopRanging: () -> Unit,
+    onSendUwbConfigReq: () -> Unit,
     onResetUwb: () -> Unit
 ) {
     Card(
@@ -608,23 +854,42 @@ private fun UwbCardSection(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    text = "UWB Integration Test",
+                    text = "UWB Ranging (Controlee)",
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.SemiBold
                 )
                 Text(
-                    text = uwbState.name,
+                    text = sessionState.name,
                     style = MaterialTheme.typography.labelSmall,
                     fontWeight = FontWeight.Bold,
-                    color = when (uwbState) {
-                        UwbState.ERROR -> MaterialTheme.colorScheme.error
-                        UwbState.READY_FOR_PEER, UwbState.IN_RANGE -> Color(0xFF2E7D32)
-                        UwbState.RANGING -> Color(0xFF1976D2)
-                        UwbState.CHECKING, UwbState.OUT_OF_RANGE, UwbState.TIMEOUT -> Color(0xFFE65100)
-                        UwbState.UNSUPPORTED -> Color(0xFF757575)
-                        UwbState.PERMISSION_REQUIRED, UwbState.SERVICE_UNAVAILABLE -> MaterialTheme.colorScheme.error
-                        UwbState.IDLE -> MaterialTheme.colorScheme.outline
+                    color = when (sessionState) {
+                        UwbSessionState.RANGING_ACTIVE -> Color(0xFF1976D2)
+                        UwbSessionState.COMPLETED -> Color(0xFF2E7D32)
+                        UwbSessionState.TIMEOUT, UwbSessionState.PEER_DISCONNECTED -> Color(0xFFE65100)
+                        UwbSessionState.ERROR, UwbSessionState.PERMISSION_REQUIRED, UwbSessionState.SERVICE_UNAVAILABLE -> MaterialTheme.colorScheme.error
+                        else -> MaterialTheme.colorScheme.outline
                     }
+                )
+            }
+
+            // Proximity & Single Access Authority Badge
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = rawDistance?.let { "ToF Distance: %.2f m".format(Locale.US, it) } ?: "ToF Distance: --",
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.Bold,
+                    color = if (rawDistance != null) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+                )
+
+                Text(
+                    text = "AUTHORITY: ESP32",
+                    style = MaterialTheme.typography.labelSmall,
+                    fontWeight = FontWeight.Bold,
+                    color = Color(0xFF1976D2)
                 )
             }
 
@@ -633,23 +898,65 @@ private fun UwbCardSection(
                 style = MaterialTheme.typography.bodySmall
             )
 
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            // Session addresses
+            if (activeLocalAddress != null) {
+                Text(
+                    text = "Ephemeral Local UWB Address: $activeLocalAddress",
+                    style = MaterialTheme.typography.bodySmall,
+                    fontFamily = FontFamily.Monospace,
+                    color = MaterialTheme.colorScheme.primary
+                )
+            }
+
+            if (uwbConfig != null) {
+                Text(
+                    text = "ESP32 Controller: [${uwbConfig.peerAddressHex}] | Ch ${uwbConfig.channel} | Session 0x%08X".format(uwbConfig.sessionId),
+                    style = MaterialTheme.typography.bodySmall,
+                    fontFamily = FontFamily.Monospace
+                )
+            } else {
+                Text(
+                    text = "Awaiting authenticated ESP32 UWB parameters from BLE (AUTH_REQ -> AUTH_RESP)...",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+
+            HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
+
+            // Action buttons
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
                 Button(
-                    onClick = onTestUwb,
-                    enabled = uwbState != UwbState.CHECKING && uwbState != UwbState.RANGING
+                    onClick = onStartRanging,
+                    enabled = bleState == BleState.UWB_CONFIG_CONFIRMED && uwbConfig != null && sessionState != UwbSessionState.RANGING_ACTIVE
                 ) {
-                    Text("Start UWB Test")
+                    Text("Start Ranging")
                 }
-                OutlinedButton(onClick = onResetUwb) {
-                    Text("Reset UWB")
+                if (sessionState == UwbSessionState.RANGING_ACTIVE) {
+                    OutlinedButton(onClick = onStopRanging) {
+                        Text("Stop Ranging")
+                    }
+                } else {
+                    OutlinedButton(onClick = onResetUwb) {
+                        Text("Reset UWB")
+                    }
                 }
             }
 
-            Text(
-                text = "ESP32 Controller coordinates UWB session and enforces final unlock authorization.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Button(
+                    onClick = onSendUwbConfigReq,
+                    enabled = bleState == BleState.AUTHENTICATED || bleState == BleState.UWB_CONFIG_CONFIRMED
+                ) {
+                    Text("Send UWB Config REQ (BLE)")
+                }
+            }
         }
     }
 }
@@ -658,8 +965,9 @@ private fun UwbCardSection(
 @Composable
 private fun StateIndicatorBadge(state: BleState) {
     val color = when (state) {
-        BleState.DATA_READY, BleState.CONNECTED -> Color(0xFF2E7D32)
-        BleState.SCANNING, BleState.FOUND, BleState.CONNECTING, BleState.DISCOVERING, BleState.MTU_NEGOTIATING, BleState.SUBSCRIBING -> Color(0xFFE65100)
+        BleState.UWB_CONFIG_CONFIRMED, BleState.AUTHENTICATED -> Color(0xFF2E7D32)
+        BleState.DATA_READY, BleState.CONNECTED -> Color(0xFF1976D2)
+        BleState.AUTHENTICATING, BleState.UWB_CONFIG_EXCHANGING, BleState.SCANNING, BleState.FOUND, BleState.CONNECTING, BleState.DISCOVERING, BleState.MTU_NEGOTIATING, BleState.SUBSCRIBING -> Color(0xFFE65100)
         BleState.ERROR -> Color(0xFFC62828)
         BleState.READY -> Color(0xFF757575)
     }
@@ -692,6 +1000,12 @@ fun SmartKeyMainScreenPreview() {
             rttMs = 18.5,
             mtu = 512,
             sessionId = 0x12345678L,
+            uwbConfig = UwbConfig(
+                peerAddress = byteArrayOf(0x00, 0x01),
+                channel = 9,
+                preambleIndex = 9,
+                sessionId = 0x12345678
+            ),
             esp32Json = "{\"phone\":200,\"esp32\":100}",
             phoneDelay = 200,
             esp32Delay = 100,
@@ -702,15 +1016,23 @@ fun SmartKeyMainScreenPreview() {
             provisionedCard = null,
             hceEvent = "NFC HCE: Ready for PN532...",
             hceVid = null,
-            uwbState = UwbState.READY_FOR_PEER,
-            uwbStatus = "UWB Controlee ready: waiting for ESP32 Controller parameters via BLE",
+            bleCapabilityReport = BleCapabilityReport(hardwareSupported = true, bluetoothEnabled = true),
+            uwbSessionState = UwbSessionState.IDLE,
+            uwbStatus = "UWB Controlee: Idle",
+            capabilityReport = UwbCapabilityReport(phoneUwbCapable = true),
+            rawDistance = 1.25f,
+            activeSessionLocalAddress = "01:0A",
             onScanBle = {},
             onResetBle = {},
+            onCheckBleCapabilities = {},
             onSendPing = {},
             onSendAuthReq = {},
+            onSendUwbConfigReq = {},
             onToggleNfcReader = {},
             onLoadMockNfc = {},
-            onTestUwb = {},
+            onCheckCapabilities = {},
+            onStartRanging = {},
+            onStopRanging = {},
             onResetUwb = {}
         )
     }
