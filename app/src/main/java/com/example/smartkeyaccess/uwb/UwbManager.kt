@@ -8,6 +8,8 @@ import android.os.SystemClock
 import androidx.core.content.ContextCompat
 import androidx.core.uwb.RangingParameters
 import androidx.core.uwb.RangingResult
+import androidx.core.uwb.UwbClientSessionScope
+import androidx.core.uwb.UwbControllerSessionScope
 import androidx.core.uwb.UwbControleeSessionScope
 import androidx.core.uwb.UwbManager as AndroidXUwbManager
 import androidx.core.uwb.exceptions.UwbApiException
@@ -27,11 +29,12 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.util.Locale
 
-// Lifecycle state of the UWB Controlee ranging session
+// Lifecycle state of the UWB Controller ranging session
 enum class UwbSessionState {
     IDLE,
     CHECKING,
     CONFIGURED,
+    WAITING_FOR_START,
     RANGING_ACTIVE,
     COMPLETED,
     TIMEOUT,
@@ -42,7 +45,14 @@ enum class UwbSessionState {
     ERROR
 }
 
-// UWB Controlee Manager: coordinates session lifecycle and receives distance telemetry.
+// Data class holding TWR timestamp telemetry and debug measurements (POLL TX, RESPONSE RX, Delta)
+data class UwbTimestampDebug(
+    val t1PollTx: String = "N/A",
+    val t4ResponseRx: String = "N/A",
+    val deltaT4T1: String = "N/A"
+)
+
+// UWB Controller Manager: coordinates session lifecycle and receives distance telemetry.
 // Unlock decision and proximity threshold are evaluated by ESP32 Access Authority.
 class UwbManager(context: Context) {
 
@@ -60,7 +70,7 @@ class UwbManager(context: Context) {
     // Backward compatibility alias
     val uwbState: StateFlow<UwbSessionState> = _sessionState.asStateFlow()
 
-    private val _status = MutableStateFlow("UWB Controlee: Idle")
+    private val _status = MutableStateFlow("UWB Controller: Idle")
     val status: StateFlow<String> = _status.asStateFlow()
 
     private val _capabilityReport = MutableStateFlow(UwbCapabilityReport())
@@ -72,11 +82,14 @@ class UwbManager(context: Context) {
     private val _latestDistanceMeters = MutableStateFlow<Float?>(null)
     val latestDistanceMeters: StateFlow<Float?> = _latestDistanceMeters.asStateFlow()
 
+    private val _timestampDebug = MutableStateFlow(UwbTimestampDebug())
+    val timestampDebug: StateFlow<UwbTimestampDebug> = _timestampDebug.asStateFlow()
+
     private val _activeSessionLocalAddress = MutableStateFlow<String?>(null)
     val activeSessionLocalAddress: StateFlow<String?> = _activeSessionLocalAddress.asStateFlow()
 
     private var activeJob: Job? = null
-    private var activeSessionScope: UwbControleeSessionScope? = null
+    private var activeSessionScope: UwbClientSessionScope? = null
 
     // Check phone's local UWB capabilities in an isolated probe scope
     fun checkCapabilities() {
@@ -161,7 +174,11 @@ class UwbManager(context: Context) {
                 return report
             }
 
-            val probeScope = manager.controleeSessionScope()
+            val probeScope: UwbClientSessionScope = try {
+                manager.controllerSessionScope()
+            } catch (_: Exception) {
+                manager.controleeSessionScope()
+            }
             val caps = probeScope.rangingCapabilities
             val probeAddress = probeScope.localAddress.toString()
 
@@ -244,8 +261,9 @@ class UwbManager(context: Context) {
     // Backward compatibility alias
     suspend fun runHardwareSelfTest(): UwbCapabilityReport = inspectCapabilities()
 
-    // Prepare local controlee scope ahead of session to obtain local UWB address for BLE handshake
-    suspend fun getOrCreateControleeScope(): UwbControleeSessionScope? {
+    // Prepare local UWB session scope ahead of session to obtain local UWB address for BLE handshake.
+    // In accordance with README, Phone acts as Controller (Initiator) coordinating ranging with ESP32 (Controlee/Responder).
+    suspend fun getOrCreateSessionScope(isController: Boolean = true): UwbClientSessionScope? {
         activeSessionScope?.let { return it }
         val manager = try {
             AndroidXUwbManager.createInstance(appContext)
@@ -257,19 +275,23 @@ class UwbManager(context: Context) {
             _status.value = "UWB subsystem is unavailable."
             return null
         }
-        val controleeScope = try {
-            manager.controleeSessionScope()
+        val scope: UwbClientSessionScope = try {
+            if (isController) manager.controllerSessionScope() else manager.controleeSessionScope()
         } catch (e: Exception) {
             _status.value = "Failed to allocate session scope: ${e.message}"
             return null
         }
-        activeSessionScope = controleeScope
-        _activeSessionLocalAddress.value = controleeScope.localAddress.toString()
-        return controleeScope
+        activeSessionScope = scope
+        _activeSessionLocalAddress.value = scope.localAddress.toString()
+        return scope
     }
 
+    // Convenience and backward-compatibility aliases
+    suspend fun getOrCreateControllerScope(): UwbClientSessionScope? = getOrCreateSessionScope(isController = true)
+    suspend fun getOrCreateControleeScope(): UwbClientSessionScope? = getOrCreateSessionScope(isController = true)
+
     suspend fun getLocalAddressBytes(): ByteArray? {
-        val s = getOrCreateControleeScope() ?: return null
+        val s = getOrCreateSessionScope(isController = true) ?: return null
         return s.localAddress.address
     }
 
@@ -291,10 +313,17 @@ class UwbManager(context: Context) {
         return null
     }
 
-    // Start UWB Controlee ranging session using parameters coordinated with ESP32
+    // Arm UWB system to wait for START UWB BLE signal from ESP32
+    fun armForStart() {
+        _sessionState.value = UwbSessionState.WAITING_FOR_START
+        _status.value = "UWB: Armed, waiting for START UWB signal from ESP32..."
+    }
+
+    // Start UWB Controller ranging session using parameters coordinated with ESP32
     fun startRanging(
         config: UwbConfig,
-        inactivityTimeoutMs: Long = 8000L
+        inactivityTimeoutMs: Long = 8000L,
+        singleShot: Boolean = true
     ) {
         if (_sessionState.value == UwbSessionState.RANGING_ACTIVE) return
 
@@ -320,9 +349,9 @@ class UwbManager(context: Context) {
                 return@launch
             }
 
-            val sessionScope = activeSessionScope ?: getOrCreateControleeScope() ?: run {
+            val sessionScope = activeSessionScope ?: getOrCreateSessionScope(isController = true) ?: run {
                 _sessionState.value = UwbSessionState.ERROR
-                _status.value = "Failed to obtain UWB controlee session scope."
+                _status.value = "Failed to obtain UWB session scope."
                 return@launch
             }
 
@@ -379,6 +408,25 @@ class UwbManager(context: Context) {
                                     "Distance: %.2fm (Access Authority: ESP32)",
                                     distance
                                 )
+
+                                // Only display real radio hardware register data.
+                                // Android UWB HAL does not expose raw t1/t4 register timestamps to apps; display N/A.
+                                _timestampDebug.value = UwbTimestampDebug(
+                                    t1PollTx = "N/A",
+                                    t4ResponseRx = "N/A",
+                                    deltaT4T1 = "N/A"
+                                )
+
+                                if (singleShot) {
+                                    _sessionState.value = UwbSessionState.COMPLETED
+                                    _status.value = String.format(
+                                        Locale.US,
+                                        "Distance: %.2fm (Access Authority: ESP32)",
+                                        distance
+                                    )
+                                    activeSessionScope = null
+                                    activeJob?.cancel(CancellationException("Single-shot ranging completed"))
+                                }
                             }
                         }
                         is RangingResult.RangingResultPeerDisconnected -> {
@@ -409,10 +457,18 @@ class UwbManager(context: Context) {
                 }
 
             } catch (e: CancellationException) {
-                if (_sessionState.value != UwbSessionState.PEER_DISCONNECTED && _sessionState.value != UwbSessionState.TIMEOUT) {
-                    _status.value = "UWB session ended."
+                if (_sessionState.value == UwbSessionState.COMPLETED) {
+                    _status.value = String.format(
+                        Locale.US,
+                        "UWB Ranging Complete (Single-shot): %.2fm",
+                        _latestDistanceMeters.value ?: 0f
+                    )
+                } else {
+                    if (_sessionState.value != UwbSessionState.PEER_DISCONNECTED && _sessionState.value != UwbSessionState.TIMEOUT) {
+                        _status.value = "UWB session ended."
+                    }
+                    purgeDistance()
                 }
-                purgeDistance()
             } catch (e: UwbApiException) {
                 _sessionState.value = UwbSessionState.ERROR
                 purgeDistance()
@@ -440,16 +496,22 @@ class UwbManager(context: Context) {
         activeJob?.cancel()
         activeJob = null
         activeSessionScope = null
-        if (_sessionState.value == UwbSessionState.RANGING_ACTIVE) {
+        if (_sessionState.value in listOf(
+                UwbSessionState.RANGING_ACTIVE,
+                UwbSessionState.WAITING_FOR_START
+            )
+        ) {
             _sessionState.value = UwbSessionState.IDLE
+            _status.value = "UWB Controller: Idle"
         }
         purgeDistance()
         _activeSessionLocalAddress.value = null
     }
 
-    // Clear distance telemetry (Mobile does not evaluate unlock decision)
+    // Clear distance and timestamp telemetry
     private fun purgeDistance() {
         _latestDistanceMeters.value = null
+        _timestampDebug.value = UwbTimestampDebug()
     }
 
     // Reset manager to idle state
@@ -457,7 +519,38 @@ class UwbManager(context: Context) {
         stopRanging()
         _capabilityReport.value = UwbCapabilityReport()
         _sessionState.value = UwbSessionState.IDLE
-        _status.value = "UWB Controlee: Idle"
+        _timestampDebug.value = UwbTimestampDebug()
+        _status.value = "UWB Controller: Idle"
+    }
+
+    // Support direct telemetry updates from ESP32 if received via BLE
+    fun updateExternalTimestamps(t1: Long, t4: Long, delta: Long? = null, distance: Float? = null) {
+        val calculatedDelta = delta ?: (t4 - t1)
+        _timestampDebug.value = UwbTimestampDebug(
+            t1PollTx = String.format(Locale.US, "%,d ns", t1),
+            t4ResponseRx = String.format(Locale.US, "%,d ns", t4),
+            deltaT4T1 = String.format(Locale.US, "%,d ns%s", calculatedDelta, if (distance != null) " (%.2fm)".format(Locale.US, distance) else "")
+        )
+    }
+
+    // Mock UWB ranging result and TWR timestamps (t1, t4, delta)
+    // Used for UI verification and telemetry debugging without physical UWB hardware.
+    fun mockRangingResult(distance: Float = 1.25f) {
+        val nowNs = SystemClock.elapsedRealtimeNanos()
+        val tofNs = (distance / 0.299792458).toLong()
+        val tReplyNs = 100_000L
+        val deltaNs = (2 * tofNs) + tReplyNs
+        val t1 = (nowNs - deltaNs).coerceAtLeast(0L)
+        val t4 = nowNs
+
+        _latestDistanceMeters.value = distance
+        _timestampDebug.value = UwbTimestampDebug(
+            t1PollTx = String.format(Locale.US, "%,d ns [MOCK]", t1 % 1_000_000_000_000L),
+            t4ResponseRx = String.format(Locale.US, "%,d ns [MOCK]", t4 % 1_000_000_000_000L),
+            deltaT4T1 = String.format(Locale.US, "%,d ns [MOCK] (ToF: %d ns | %.2fm)", deltaNs, tofNs, distance)
+        )
+        _sessionState.value = UwbSessionState.COMPLETED
+        _status.value = String.format(Locale.US, "Distance: %.2fm [MOCK] (Access Authority: ESP32)", distance)
     }
 
     fun cleanup() {

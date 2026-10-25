@@ -22,6 +22,7 @@ import android.os.Looper
 import android.os.SystemClock
 import androidx.core.content.ContextCompat
 import androidx.core.uwb.RangingParameters
+import com.example.smartkeyaccess.crypto.AesGcm
 import com.example.smartkeyaccess.crypto.CryptoManager
 import com.example.smartkeyaccess.mock.MockDataProvider
 import com.example.smartkeyaccess.protocol.SmartKeyProtocol
@@ -30,6 +31,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import org.json.JSONObject
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.security.SecureRandom
 import java.util.Locale
 import java.util.UUID
@@ -104,16 +107,56 @@ class BleManager(
     private val _nonceEvent = MutableStateFlow<String?>(null)
     val nonceEvent: StateFlow<String?> = _nonceEvent.asStateFlow()
 
+    private val _startUwbTrigger = MutableStateFlow<Long>(0L)
+    val startUwbTrigger: StateFlow<Long> = _startUwbTrigger.asStateFlow()
+
     private var currentMasterKey: ByteArray? = null
     private var lastPhoneNonce: ByteArray? = null
     private var lastPhoneNonceSent: ByteArray? = null
     private var lastLockNonceRecv: ByteArray? = null
     private var sessionStsKey: ByteArray? = null
+    private var sessionBleKey: ByteArray? = null
+    private var sessionHmacKey: ByteArray? = null
     private var pendingRequestType: Byte? = null
     private var pendingSeqNum: Int = 0
 
     private val _lockDeviceId = MutableStateFlow<ByteArray?>(null)
     val lockDeviceId: StateFlow<ByteArray?> = _lockDeviceId.asStateFlow()
+
+    private val _esp32UwbAddress = MutableStateFlow<ByteArray?>(null)
+    val esp32UwbAddress: StateFlow<ByteArray?> = _esp32UwbAddress.asStateFlow()
+
+    private var localPhoneUwbAddress: ByteArray? = null
+    private var _pendingUwbConfig: UwbConfig? = null
+
+    fun setLocalPhoneUwbAddress(addr: ByteArray?) {
+        localPhoneUwbAddress = if (addr != null && addr.size == 2) addr.copyOf() else null
+    }
+
+    // Fail-closed key access: strictly returns verified KEY_BLE; NO fallback to MSK or STS key
+    fun getActiveAesKey(): ByteArray? = sessionBleKey
+
+    // Fail-closed key access: strictly returns verified KEY_HMAC; NO fallback to MSK or STS key
+    fun getActiveHmacKey(): ByteArray? = sessionHmacKey
+
+    fun setSessionBleKey(key: ByteArray?) {
+        sessionBleKey = if (key != null && key.size == 16) key.copyOf() else null
+    }
+
+    fun setSessionHmacKey(key: ByteArray?) {
+        sessionHmacKey = if (key != null && (key.size == 32 || key.size == 16)) key.copyOf() else null
+    }
+
+    // Install verified keys derived through ECDH + HKDF handshake
+    fun installVerifiedEcdhSessionKeys(bleKey: ByteArray, stsKey: ByteArray, hmacKey: ByteArray) {
+        require(bleKey.size == 16) { "BLE key must be 16 bytes" }
+        require(stsKey.size == 16) { "STS key must be 16 bytes" }
+        require(hmacKey.size == 32 || hmacKey.size == 16) { "HMAC key must be 16 or 32 bytes" }
+        sessionBleKey = bleKey.copyOf()
+        sessionStsKey = stsKey.copyOf()
+        sessionHmacKey = hmacKey.copyOf()
+        _status.value = "Verified ECDH session keys installed (BLE, STS, HMAC)."
+    }
 
     fun setMasterKey(key: ByteArray?) {
         if (key == null) {
@@ -244,10 +287,8 @@ class BleManager(
         return true
     }
 
-    /**
-     * Connects to ESP32: initiates BLE scanning with filter for SERVICE_UUID,
-     * connects GATT, negotiates MTU, and enables notifications.
-     */
+    // Connects to ESP32: initiates BLE scanning with filter for SERVICE_UUID,
+    // connects GATT, negotiates MTU, and enables notifications.
     fun connectToEsp32(adapter: BluetoothAdapter): Boolean = startScan(adapter)
 
     fun stopScan() {
@@ -279,6 +320,12 @@ class BleManager(
         lastPhoneNonceSent = null
         lastLockNonceRecv = null
         sessionStsKey = null
+        sessionBleKey = null
+        sessionHmacKey = null
+        _pendingUwbConfig = null
+        _esp32UwbAddress.value = null
+        localPhoneUwbAddress = null
+        _startUwbTrigger.value = 0L
         _sessionId.value = null
         _uwbConfig.value = null
         _lockDeviceId.value = null
@@ -543,6 +590,145 @@ class BleManager(
         }
     }
 
+    // Pack 14-byte plaintext in Little-Endian and encrypt via AES-GCM (42-byte wire packet)
+    // Wire format: Nonce (12B) + Ciphertext (14B) + Tag (16B) = 42 bytes
+    // Plaintext layout (14B, Little-Endian):
+    // [sessionId 4B] + [MACphone 2B] + [channel 4B] + [preambleIndex 4B]
+    // AAD: "UWB CONFIG FORM PHONE" (as defined in Mota checklist)
+    fun sendUwbConfigFromPhone(
+        peerAddress: ByteArray? = _esp32UwbAddress.value,
+        phoneUwbAddress: ByteArray? = null,
+        channel: Int = 9,
+        preambleIndex: Int = 9
+    ): Boolean {
+        if (requestPending || pendingWrite != null) {
+            _status.value = "BLE request already in progress; waiting..."
+            return false
+        }
+
+        // 1. Require verified peer address (from decrypted MAC ESP32); reject dummy 01 02
+        val peer = peerAddress ?: _esp32UwbAddress.value ?: run {
+            _bleState.value = BleState.ERROR
+            _status.value = "UWB Config rejected: ESP32 UWB MAC address not discovered/decrypted yet."
+            return false
+        }
+        if (peer.size != 2) {
+            _bleState.value = BleState.ERROR
+            _status.value = "UWB Config rejected: ESP32 UWB MAC must be 2 bytes (got ${peer.size}B)."
+            return false
+        }
+
+        // 2. Require verified local phone UWB address; reject dummy 11 22
+        val phoneAddr = phoneUwbAddress ?: localPhoneUwbAddress ?: run {
+            _bleState.value = BleState.ERROR
+            _status.value = "UWB Config rejected: Local Phone UWB address not allocated by UWB subsystem."
+            return false
+        }
+        if (phoneAddr.size != 2) {
+            _bleState.value = BleState.ERROR
+            _status.value = "UWB Config rejected: Local Phone UWB address must be 2 bytes (got ${phoneAddr.size}B)."
+            return false
+        }
+
+        // 3. Require active verified session ID; reject dummy 0x11223344
+        val rawSid = _sessionId.value ?: run {
+            _bleState.value = BleState.ERROR
+            _status.value = "UWB Config rejected: Active authenticated session ID missing."
+            return false
+        }
+        if (rawSid == 0L) {
+            _bleState.value = BleState.ERROR
+            _status.value = "UWB Config rejected: Session ID is 0 (invalid session)."
+            return false
+        }
+        val sid = rawSid.toInt()
+
+        // 4. Require verified session BLE key (KEY_BLE); reject MSK/STS/zero key
+        val key = getActiveAesKey() ?: run {
+            _bleState.value = BleState.ERROR
+            _status.value = "UWB Config aborted: Verified session BLE key (KEY_BLE) not established."
+            return false
+        }
+
+        val stsKey = sessionStsKey ?: run {
+            _bleState.value = BleState.ERROR
+            _status.value = "UWB Config aborted: Verified UWB STS key not established."
+            return false
+        }
+
+        // 14-byte plaintext in Little-Endian byte order via UwbBlePacketCodec
+        val plaintext = try {
+            UwbBlePacketCodec.encodeUwbConfigPlaintext(
+                sessionId = sid,
+                phoneMac = phoneAddr,
+                channel = channel,
+                preambleIndex = preambleIndex
+            )
+        } catch (e: Exception) {
+            _bleState.value = BleState.ERROR
+            _status.value = "UWB Config encoding failed: ${e.message}"
+            return false
+        }
+
+        val packet = try {
+            UwbBlePacketCodec.encryptUwbConfigPacket(
+                key = key,
+                plaintext14B = plaintext
+            )
+        } catch (e: Exception) {
+            _status.value = "Encryption error for UWB Config: ${e.message}"
+            return false
+        }
+
+        // Store pending configuration until ESP32 acknowledges application-level acceptance
+        _pendingUwbConfig = UwbConfig(
+            peerAddress = peer,
+            channel = channel,
+            preambleIndex = preambleIndex,
+            sessionId = sid,
+            configId = RangingParameters.CONFIG_PROVISIONED_UNICAST_DS_TWR,
+            sessionKeyInfo = stsKey
+        )
+
+        _bleState.value = BleState.UWB_CONFIG_EXCHANGING
+        _status.value = "Sending UWB CONFIG FORM PHONE (42B, Little-Endian)..."
+
+        val sent = writeBleFrame(packet) { errCode ->
+            failGatt("UWB CONFIG FORM PHONE write failed (code $errCode)")
+        }
+
+        if (sent) {
+            // Transport write success does NOT mean ESP32 has verified and applied configuration.
+            // Remain in UWB_CONFIG_EXCHANGING until authenticated ESP32 acceptance is received.
+            _status.value = "UWB CONFIG sent (42B). Waiting for ESP32 confirmation/ACK..."
+        }
+        return sent
+    }
+
+    // Called when ESP32 confirms authenticated receipt and application-level configuration
+    fun onAuthenticatedUwbConfigAccepted() {
+        val config = _pendingUwbConfig ?: _uwbConfig.value ?: run {
+            _status.value = "Cannot confirm UWB Config: No pending configuration."
+            return
+        }
+        _uwbConfig.value = config
+        _pendingUwbConfig = null
+        _bleState.value = BleState.UWB_CONFIG_CONFIRMED
+        _status.value = "UWB Config accepted by ESP32! Session ready for START UWB."
+    }
+
+    // Manual/mock testing helper to simulate ESP32 ACK when firmware ACK is not yet implemented
+    fun simulateUwbConfigAcceptedForTesting() {
+        val config = _pendingUwbConfig ?: _uwbConfig.value ?: run {
+            _status.value = "[MOCK TEST] Cannot confirm UWB Config: No pending configuration."
+            return
+        }
+        _uwbConfig.value = config
+        _pendingUwbConfig = null
+        _bleState.value = BleState.UWB_CONFIG_CONFIRMED
+        _status.value = "[MOCK TEST] UWB Config confirmed via simulated ACK (Not validated by ESP32)."
+    }
+
     private val gattCallback = object : BluetoothGattCallback() {
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
             if (status == BluetoothGatt.GATT_SUCCESS && newState == BluetoothProfile.STATE_CONNECTED) {
@@ -766,6 +952,53 @@ class BleManager(
             } catch (_: Exception) {}
         }
 
+        // 1. MAC ESP32 packet from Mota checklist:
+        // Wire format: Nonce (12B) + Ciphertext (2B) + Tag (16B) = 30 bytes
+        // Android does NOT receive descriptors with notification; dispatch by size (30B)
+        if (value.size == UwbBlePacketCodec.PACKET_ESP32_MAC_SIZE) {
+            val key = getActiveAesKey() ?: run {
+                _status.value = "Cannot decrypt MAC ESP32: Verified AES key not available (fail-closed)."
+                return
+            }
+
+            val decrypted = UwbBlePacketCodec.decryptEsp32Mac(key, value)
+            if (decrypted != null && decrypted.size == 2) {
+                _esp32UwbAddress.value = decrypted
+                _status.value = "MAC ESP32 verified: 0x${CryptoManager.toHex(decrypted)}. Ready to send UWB Config."
+                return
+            } else {
+                _status.value = "Received 30B packet but AES-GCM decryption failed (tag mismatch or untrusted ESP32)"
+            }
+        }
+
+        // 2. Unauthenticated notifications while awaiting UWB Config confirmation:
+        // Do NOT auto-confirm on raw text "ACK" or unauthenticated 0x22 byte.
+        // True confirmation requires an authenticated cryptographic frame (MSG_UWB_CONFIG_RESP)
+        // or explicit developer mock test trigger.
+        if (_bleState.value == BleState.UWB_CONFIG_EXCHANGING) {
+            if (textValue == "ACK" || (value.size == 1 && value[0] == 0x22.toByte())) {
+                _status.value = "Received unauthenticated '${textValue ?: "0x22"}'; awaiting authenticated application ACK."
+            }
+        }
+
+        // 3. START UWB trigger verification from ESP32:
+        // Strictly enforce:
+        //  - MUST be in UWB_CONFIG_CONFIRMED state
+        //  - MUST match HMAC-SHA256 of START_SIGN using verified KEY_HMAC
+        //  - Plaintext strings ("START UWB") and static 4-byte values are strictly REJECTED
+        val isHmacLength = value.size == 32 || value.size == 16
+        if (isHmacLength && _bleState.value == BleState.UWB_CONFIG_CONFIRMED) {
+            val hmacKey = getActiveHmacKey()
+            if (hmacKey != null && UwbBlePacketCodec.verifyStartHmac(hmacKey, value)) {
+                _startUwbTrigger.value = System.currentTimeMillis()
+                _status.value = "START UWB HMAC verified! Triggering UWB session..."
+                return
+            }
+        }
+        if (textValue != null && textValue.contains("START UWB", ignoreCase = true)) {
+            _status.value = "Ignored unauthenticated plaintext 'START UWB'. Cryptographic HMAC required."
+        }
+
         // SmartKeyProtocol binary frame
         val header = SmartKeyProtocol.parseHeader(value)
         if (header != null) {
@@ -870,6 +1103,16 @@ class BleManager(
                         keyLength = 16
                     )
                     sessionStsKey = stsKey
+                    sessionBleKey = SmartKeyProtocol.deriveBleTrafficKey(
+                        sharedSecret = msk,
+                        phoneNonce = phoneNonce,
+                        lockNonce = authResp.lockNonce
+                    )
+                    sessionHmacKey = SmartKeyProtocol.deriveHmacKey(
+                        sharedSecret = msk,
+                        phoneNonce = phoneNonce,
+                        lockNonce = authResp.lockNonce
+                    )
                     lastLockNonceRecv = authResp.lockNonce
 
                     // Keep _uwbConfig null until UWB_CONFIG_RESP confirms the true ESP32 UWB address!
@@ -954,7 +1197,7 @@ class BleManager(
                         )
 
                         _bleState.value = BleState.UWB_CONFIG_CONFIRMED
-                        _status.value = "UWB_CONFIG_CONFIRMED by ESP32 Controller! (Peer: ${_uwbConfig.value?.peerAddressHex}). Ready to range."
+                        _status.value = "UWB_CONFIG_CONFIRMED with ESP32 Controlee! (Peer: ${_uwbConfig.value?.peerAddressHex}). Ready to range."
                     } else {
                         val err = configResp?.status ?: SmartKeyProtocol.ERR_INTERNAL_FAULT
                         _bleState.value = BleState.ERROR
@@ -987,12 +1230,10 @@ class BleManager(
         }
     }
 
-    /**
-     * Receives the raw challenge bytes from the dedicated nonce characteristic.
-     * Transport dispatch is ready, but the authentication response is blocked:
-     * firmware has not yet confirmed the HMAC key/input, ECDSA signing input, or
-     * response byte format. Do not sign the raw nonce or claim authentication.
-     */
+    // Receives the raw challenge bytes from the dedicated nonce characteristic.
+    // Transport dispatch is ready, but the authentication response is blocked:
+    // firmware has not yet confirmed the HMAC key/input, ECDSA signing input, or
+    // response byte format. Do not sign the raw nonce or claim authentication.
     private fun handleNonceMessage(value: ByteArray) {
         _nonceEvent.value =
             "Nonce received (${value.size}B); response BLOCKED pending firmware HMAC/signing contract"

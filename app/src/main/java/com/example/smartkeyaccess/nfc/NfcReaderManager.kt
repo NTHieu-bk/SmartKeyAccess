@@ -110,17 +110,15 @@ class NfcReaderManager(
         }
     }
 
-    /**
-     * Detects the physical tag without guessing where credentials are stored.
-     *
-     * The firmware contract has not yet defined the exact card technology,
-     * authentication key, VID block/page, or MSK blocks/pages. Reading sector 1
-     * with the default key or pages 4/8/12 would turn an unconfirmed test layout
-     * into production behavior, so raw I/O intentionally remains blocked here.
-     * Once the contract is frozen, this method should connect to the confirmed
-     * technology, read only the specified raw locations, close the tag in a
-     * `finally` block, and return `ReadResult.Success` after parser validation.
-     */
+    // Detects the physical tag without guessing where credentials are stored.
+    //
+    // The firmware contract has not yet defined the exact card technology,
+    // authentication key, VID block/page, or MSK blocks/pages. Reading sector 1
+    // with the default key or pages 4/8/12 would turn an unconfirmed test layout
+    // into production behavior, so raw I/O intentionally remains blocked here.
+    // Once the contract is frozen, this method should connect to the confirmed
+    // technology, read only the specified raw locations, close the tag in a
+    // `finally` block, and return `ReadResult.Success` after parser validation.
     private fun readTagData(tag: Tag): ReadResult {
         val techList = tag.techList.map { it.substringAfterLast(".") }
         val detected = if (techList.isEmpty()) "unknown" else techList.joinToString()

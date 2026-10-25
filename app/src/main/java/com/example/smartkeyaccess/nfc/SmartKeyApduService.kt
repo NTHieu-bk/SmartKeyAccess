@@ -9,7 +9,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import java.security.KeyPair
 import java.security.interfaces.ECPublicKey
 
-/** Shared provisioning data between NFC Reader and Phone HCE. */
+// Shared provisioning data between NFC Reader and Phone HCE.
 object NfcHceBridge {
     private val _eventFlow = MutableStateFlow("NFC HCE: Waiting for PN532")
     val eventFlow: StateFlow<String> = _eventFlow.asStateFlow()
@@ -27,7 +27,7 @@ object NfcHceBridge {
         _eventFlow.value = event
     }
 
-    /** The only production entry point for new trusted Card VID/MSK material. */
+    // The only production entry point for new trusted Card VID/MSK material.
     fun updateProvisionedCard(vid: ByteArray, msk: ByteArray) {
         require(vid.size == 8) { "VID must be 8 bytes" }
         require(msk.size == 32) { "MSK must be 32 bytes" }
@@ -35,7 +35,7 @@ object NfcHceBridge {
         _provisionedMsk.value = msk.copyOf()
     }
 
-    /** For legacy UI use ONLY: does not change the authenticated/provisioned VID. */
+    // For legacy UI use ONLY: does not change the authenticated/provisioned VID.
     @Deprecated("Do not overwrite a trusted card VID with a VID sent by ESP32")
     fun updateVehicleId(@Suppress("UNUSED_PARAMETER") vid: ByteArray) {
         updateEvent("NFC: updateVehicleId ignored (use updateProvisionedCard)")
@@ -69,12 +69,10 @@ class SmartKeyApduService : HostApduService() {
         private const val VID_NONCE_SIZE = 24 // VID(8) || nonce(16)
         private const val SIGN_NONCE_SIZE = 24 // Proposed by latest team diagram; confirm!
 
-        /**
-         * The old APDU source signs the RAW nonce. The latest Kiá»‡t diagram
-         * proposes signing HMAC-SHA256(MSK, signingNonce). Until firmware
-         * explicitly freezes it, keep RAW_NONCE for compatibility with old code.
-         * Change BOTH sides together, never silently switch here.
-         */
+        // The old APDU source signs the RAW nonce. The latest Kiet diagram
+        // proposes signing HMAC-SHA256(MSK, signingNonce). Until firmware
+        // explicitly freezes it, keep RAW_NONCE for compatibility with old code.
+        // Change BOTH sides together, never silently switch here.
         private enum class SigningMode { RAW_NONCE, HMAC_MSK_NONCE }
         private val SIGNING_MODE = SigningMode.RAW_NONCE
     }
@@ -125,7 +123,7 @@ class SmartKeyApduService : HostApduService() {
         }
     }
 
-    /** Case 3 short APDU [CLA INS P1 P2 Lc data] (optional trailing Le). */
+    // Case 3 short APDU [CLA INS P1 P2 Lc data] (optional trailing Le).
     private fun receiveFromEsp32(tag: Byte, apdu: ByteArray): ByteArray {
         if (apdu.size < 5) return SW_WRONG_LENGTH
         val lc = apdu[4].toInt() and 0xFF
@@ -203,7 +201,7 @@ class SmartKeyApduService : HostApduService() {
         }
     }
 
-    /** Case 2 short APDU [CLA INS P1 P2 (Le)]; Le=0 means up to 256 bytes. */
+    // Case 2 short APDU [CLA INS P1 P2 (Le)]; Le=0 means up to 256 bytes.
     private fun sendToEsp32(tag: Byte, apdu: ByteArray): ByteArray {
         if (apdu.size != 4 && apdu.size != 5) return SW_WRONG_LENGTH
         val le = if (apdu.size == 5) (apdu[4].toInt() and 0xFF).let { if (it == 0) 256 else it }

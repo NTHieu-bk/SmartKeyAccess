@@ -20,17 +20,15 @@ import javax.crypto.KeyAgreement
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 
-/**
- * Shared cryptographic utilities for the Smart Key Android application.
- *
- * Responsibilities:
- * - SHA-256 and HMAC-SHA256.
- * - Ephemeral P-256 ECDH, key encoding/decoding, and HKDF key derivation.
- * - Persistent Android Keystore identity and ECDSA P1363 signatures.
- *
- * AES-128-GCM encrypt/decrypt lives exclusively in [AesGcm].
- * This object does not construct BLE packets or decide whether a vehicle unlocks.
- */
+// Shared cryptographic utilities for the Smart Key Android application.
+//
+// Responsibilities:
+// - SHA-256 and HMAC-SHA256.
+// - Ephemeral P-256 ECDH, key encoding/decoding, and HKDF key derivation.
+// - Persistent Android Keystore identity and ECDSA P1363 signatures.
+//
+// AES-128-GCM encrypt/decrypt lives exclusively in [AesGcm].
+// This object does not construct BLE packets or decide whether a vehicle unlocks.
 object CryptoManager {
 
     private const val EC_CURVE_NAME = "secp256r1"
@@ -43,17 +41,15 @@ object CryptoManager {
 
     val DEFAULT_HKDF_INFO: ByteArray = "SmartKey-UWB-AES128-v1".toByteArray(Charsets.UTF_8)
 
-    /** Hash arbitrary bytes with SHA-256 (32B output); no secret key is involved. */
+    // Hash arbitrary bytes with SHA-256 (32B output); no secret key is involved.
     fun computeSha256(data: ByteArray): ByteArray {
         val digest = MessageDigest.getInstance(HASH_ALGORITHM)
         return digest.digest(data)
     }
 
-    /**
-     * Compute a 32-byte HMAC-SHA256 authentication code.
-     * [key] can be the provisioned MSK or another agreed MAC/session key.
-     * The caller must agree with ESP32 on the exact input bytes and key.
-     */
+    // Compute a 32-byte HMAC-SHA256 authentication code.
+    // [key] can be the provisioned MSK or another agreed MAC/session key.
+    // The caller must agree with ESP32 on the exact input bytes and key.
     fun computeHmacSha256(key: ByteArray, data: ByteArray): ByteArray {
         val mac = Mac.getInstance(HMAC_ALGORITHM)
         val keySpec = SecretKeySpec(key, HMAC_ALGORITHM)
@@ -61,10 +57,8 @@ object CryptoManager {
         return mac.doFinal(data)
     }
 
-    /**
-     * Create a fresh ephemeral P-256 ECDH key pair for the current session.
-     * Keep the private key local; exchange only the encoded public key.
-     */
+    // Create a fresh ephemeral P-256 ECDH key pair for the current session.
+    // Keep the private key local; exchange only the encoded public key.
     fun generateEcdhKeyPair(): KeyPair {
         val kpg = KeyPairGenerator.getInstance("EC")
         val ecSpec = ECGenParameterSpec(EC_CURVE_NAME)
@@ -72,12 +66,10 @@ object CryptoManager {
         return kpg.generateKeyPair()
     }
 
-    /**
-     * SEC1 P-256 raw uncompressed public key, 65 bytes: 0x04 || X(32) || Y(32).
-     * Use this exact encoding for NFC TAG_KEY once the ESP32 contract confirms 65B.
-     * The same encoding can represent a P-256 signing or ECDH public key; it
-     * does NOT mean the two key pairs have the same lifecycle.
-     */
+    // SEC1 P-256 raw uncompressed public key, 65 bytes: 0x04 || X(32) || Y(32).
+    // Use this exact encoding for NFC TAG_KEY once the ESP32 contract confirms 65B.
+    // The same encoding can represent a P-256 signing or ECDH public key; it
+    // does NOT mean the two key pairs have the same lifecycle.
     fun encodeUncompressedEcPoint(publicKey: ECPublicKey): ByteArray {
         val xBytes = toUnsigned32Bytes(publicKey.w.affineX)
         val yBytes = toUnsigned32Bytes(publicKey.w.affineY)
@@ -127,11 +119,9 @@ object CryptoManager {
         return keyFactory.generatePublic(keySpec) as ECPublicKey
     }
 
-    /**
-     * Calculate an ECDH shared secret from our private key and a peer public key.
-     * Both peers should derive matching secret bytes using matching EC parameters.
-     * The shared secret must never be transmitted; authenticate the peer key first.
-     */
+    // Calculate an ECDH shared secret from our private key and a peer public key.
+    // Both peers should derive matching secret bytes using matching EC parameters.
+    // The shared secret must never be transmitted; authenticate the peer key first.
     fun computeSharedSecret(privateKey: ECPrivateKey, peerPublicKey: ECPublicKey): ByteArray {
         val keyAgreement = KeyAgreement.getInstance(ECDH_ALGORITHM)
         keyAgreement.init(privateKey)
@@ -139,17 +129,15 @@ object CryptoManager {
         return keyAgreement.generateSecret()
     }
 
-    /**
-     * Existing HKDF-SHA256 extract/expand helper (returns up to 32 bytes).
-     *
-     * Uses an all-zero 32-byte salt and one HKDF-Expand block T(1):
-     *   PRK = HMAC(zeroSalt, sharedSecret)
-     *   T(1) = HMAC(PRK, info || 0x01)
-     *
-     * IMPORTANT: This is the ORIGINAL behavior, preserved to avoid a protocol change.
-     * It does NOT derive 3 independent BLE/UWB/MAC keys in one call.
-     * Agree on salt, info, key separation, and output layout with ESP32 before use.
-     */
+    // Existing HKDF-SHA256 extract/expand helper (returns up to 32 bytes).
+    //
+    // Uses an all-zero 32-byte salt and one HKDF-Expand block T(1):
+    //   PRK = HMAC(zeroSalt, sharedSecret)
+    //   T(1) = HMAC(PRK, info || 0x01)
+    //
+    // IMPORTANT: This is the ORIGINAL behavior, preserved to avoid a protocol change.
+    // It does NOT derive 3 independent BLE/UWB/MAC keys in one call.
+    // Agree on salt, info, key separation, and output layout with ESP32 before use.
     fun deriveSessionKey(
         sharedSecret: ByteArray,
         info: ByteArray = DEFAULT_HKDF_INFO,
@@ -169,11 +157,11 @@ object CryptoManager {
         return t1.copyOf(keyLength)
     }
 
-    /** Format bytes as uppercase hex for diagnostics; do not log keys or secrets. */
+    // Format bytes as uppercase hex for diagnostics; do not log keys or secrets.
     fun toHex(bytes: ByteArray): String =
         bytes.joinToString("") { String.format(Locale.US, "%02X", it) }
 
-    /** Parse an even-length hexadecimal string into bytes. */
+    // Parse an even-length hexadecimal string into bytes.
     fun fromHex(hex: String): ByteArray {
         val cleanHex = hex.replace(" ", "")
         require(cleanHex.length % 2 == 0) { "Hex string must have an even length" }
@@ -204,12 +192,10 @@ object CryptoManager {
         return params.getParameterSpec(ECParameterSpec::class.java)
     }
 
-    /**
-     * Persistent signing identity. Fail CLOSED when AndroidKeyStore is unavailable.
-     * Never silently generate a replacement in-memory identity on failures:
-     * otherwise ESP32 may have enrolled a different public key.
-     * Host JVM tests should test crypto primitives with generateEcdhKeyPair().
-     */
+    // Persistent signing identity. Fail CLOSED when AndroidKeyStore is unavailable.
+    // Never silently generate a replacement in-memory identity on failures:
+    // otherwise ESP32 may have enrolled a different public key.
+    // Host JVM tests should test crypto primitives with generateEcdhKeyPair().
     fun getOrCreateIdentityKeyPair(): KeyPair {
         val keyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
         if (!keyStore.containsAlias(PHONE_IDENTITY_KEY_ALIAS)) {
@@ -235,11 +221,9 @@ object CryptoManager {
 
     fun generateIdentityKeyPair(): KeyPair = getOrCreateIdentityKeyPair()
 
-    /**
-     * ECDSA P-256 signature, IEEE P1363 wire encoding: 32B r || 32B s (64B).
-     * SHA256withECDSA hashes [data] internally; it does NOT compute HMAC by itself.
-     * If the protocol requires signing an HMAC output, compute the HMAC separately.
-     */
+    // ECDSA P-256 signature, IEEE P1363 wire encoding: 32B r || 32B s (64B).
+    // SHA256withECDSA hashes [data] internally; it does NOT compute HMAC by itself.
+    // If the protocol requires signing an HMAC output, compute the HMAC separately.
     fun signEcdsaP1363(privateKey: java.security.PrivateKey, data: ByteArray): ByteArray {
         return try {
             val sig = java.security.Signature.getInstance("SHA256withECDSAinP1363Format")
@@ -254,10 +238,8 @@ object CryptoManager {
         }
     }
 
-    /**
-     * Verify 64-byte P1363 ECDSA signature against [data] (hashed internally).
-     * Returns false on invalid signatures and supported-provider failures.
-     */
+    // Verify 64-byte P1363 ECDSA signature against [data] (hashed internally).
+    // Returns false on invalid signatures and supported-provider failures.
     fun verifyEcdsaP1363(publicKey: ECPublicKey, data: ByteArray, signatureP1363: ByteArray): Boolean {
         if (signatureP1363.size != 64) return false
         return try {

@@ -216,6 +216,25 @@ object SmartKeyProtocol {
         return okm.copyOf(16)
     }
 
+    // Derive a dedicated HMAC authentication key (32 bytes) for START UWB verification
+    fun deriveHmacKey(
+        sharedSecret: ByteArray,
+        phoneNonce: ByteArray,
+        lockNonce: ByteArray
+    ): ByteArray {
+        val salt = phoneNonce + lockNonce
+        val prkMac = Mac.getInstance("HmacSHA256")
+        prkMac.init(SecretKeySpec(salt, "HmacSHA256"))
+        val prk = prkMac.doFinal(sharedSecret)
+
+        val expandMac = Mac.getInstance("HmacSHA256")
+        expandMac.init(SecretKeySpec(prk, "HmacSHA256"))
+        expandMac.update("smartkey/hmac".toByteArray(Charsets.UTF_8))
+        expandMac.update(0x01.toByte())
+        val okm = expandMac.doFinal()
+        return okm.copyOf(32)
+    }
+
     // Encrypt sensitive key material using AES-128-CTR with deterministic nonce
     fun encryptSensitivePayload(key: ByteArray, iv: ByteArray, plaintext: ByteArray): ByteArray {
         val cipher = Cipher.getInstance("AES/CTR/NoPadding")
